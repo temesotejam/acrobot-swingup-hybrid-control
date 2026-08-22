@@ -7,7 +7,7 @@ import numpy as np
 from .controllers import lqr_command, trajectory_feedback_command, tvlqr_gains, upright_lqr_gain
 from .optimization import OptimizationResult, refine_trajectory_for_model
 from .plant import AcrobotPlant, PhysicsConfig
-from .sensing import NoisyStateSensor, SensorNoiseConfig
+from .sensing import ModelPredictiveObserver, NoisyStateSensor, SensorNoiseConfig
 from .simulation import SimulationHistory
 
 
@@ -29,11 +29,7 @@ class AdaptiveSimulationResult:
 
 
 def candidate_physics_models(nominal: PhysicsConfig) -> dict[str, PhysicsConfig]:
-    """Uncertainty bank used by the online multiple-model estimator.
-
-    These are controller hypotheses, not privileged access to the simulated
-    plant. Selection is made only from observed state transitions.
-    """
+    """Uncertainty bank used by the online multiple-model estimator."""
     return {
         "nominal": nominal,
         "mass/inertia +2%": replace(
@@ -80,29 +76,54 @@ def candidate_physics_models(nominal: PhysicsConfig) -> dict[str, PhysicsConfig]
 
 
 class ModelBankEstimator:
-    """Select the model that best predicts observed one-step transitions."""
+    """Select a model by rolling each hypothesis over the observed command window.
+
+    A one-step residual is easily dominated by sensor white noise because every
+    prediction is restarted from a new noisy observation. Here each candidate
+    starts from the first observed state and is propagated through the complete
+    identification command sequence, making persistent dynamics differences
+    accumulate while zero-mean measurement noise is averaged over the window.
+    """
 
     def __init__(self, models: dict[str, PhysicsConfig]):
         self.plants = {name: AcrobotPlant(config, wrap_angles=False) for name, config in models.items()}
-        self.errors = {name: 0.0 for name in models}
-        # Accelerations and actuator dynamics carry most parameter information.
-        self.weights = np.array([0.25, 0.25, 4.0, 2.0, 1.0], dtype=np.float64)
+        self.weights = np.array([0.05, 0.05, 4.0, 2.0, 0.5], dtype=np.float64)
+        self.initial_state: np.ndarray | None = None
+        self.commands: list[float] = []
+        self.observations: list[np.ndarray] = []
         self.samples = 0
 
     def update(self, state: np.ndarray, command_nm: float, next_state: np.ndarray) -> None:
         before = np.asarray(state, dtype=np.float64)
         after = np.asarray(next_state, dtype=np.float64)
-        for name, plant in self.plants.items():
-            residual = after - plant.step(before, command_nm)
-            self.errors[name] += float(np.sum(self.weights * np.square(residual)))
+        if self.initial_state is None:
+            self.initial_state = before.copy()
+            self.observations = [before.copy()]
+        self.commands.append(float(command_nm))
+        self.observations.append(after.copy())
         self.samples += 1
 
+    def _rollout_errors(self) -> dict[str, float]:
+        if self.initial_state is None or not self.commands:
+            return {name: 0.0 for name in self.plants}
+        errors: dict[str, float] = {}
+        for name, plant in self.plants.items():
+            predicted = self.initial_state.copy()
+            total = 0.0
+            for command, observed in zip(self.commands, self.observations[1:], strict=True):
+                predicted = plant.step(predicted, command)
+                residual = observed - predicted
+                total += float(np.sum(self.weights * np.square(residual)))
+            errors[name] = total
+        return errors
+
     def selected_model(self) -> str:
-        return min(self.errors, key=self.errors.get)
+        errors = self._rollout_errors()
+        return min(errors, key=errors.get)
 
     def normalized_errors(self) -> dict[str, float]:
         denominator = max(1, self.samples)
-        return {name: float(value / denominator) for name, value in self.errors.items()}
+        return {name: float(value / denominator) for name, value in self._rollout_errors().items()}
 
 
 def build_adaptive_library(
@@ -110,7 +131,6 @@ def build_adaptive_library(
     nominal_optimization: OptimizationResult,
     candidate_torque_limit_nm: float = 0.99,
 ) -> dict[str, AdaptiveLibraryEntry]:
-    """Build constrained nonlinear replans for the uncertainty bank."""
     configs = candidate_physics_models(nominal_plant.config)
     library: dict[str, AdaptiveLibraryEntry] = {}
     for name, config in configs.items():
@@ -142,11 +162,11 @@ def simulate_adaptive_hybrid(
     sensor_noise: SensorNoiseConfig | None = None,
     sensor_seed: int = 0,
 ) -> AdaptiveSimulationResult:
-    """Identify the plant online, then switch to its nonlinear replan + TVLQR.
+    """Identify the plant online, track its nonlinear replan, then balance.
 
-    When `sensor_noise` is supplied, the model estimator and every feedback
-    controller use the same noisy/bias-contaminated measured state. True state
-    is retained only inside the simulator and for post-run evaluation.
+    With sensor noise enabled, raw observations are used by the multi-step
+    model estimator while feedback control uses a lightweight model-predictive
+    observer. True state remains hidden inside the simulator except for metrics.
     """
     if "nominal" not in library:
         raise ValueError("adaptive library must contain a nominal entry")
@@ -168,7 +188,9 @@ def simulate_adaptive_hybrid(
     def observe(value: np.ndarray) -> np.ndarray:
         return np.asarray(value, dtype=np.float64).copy() if sensor is None else sensor.observe(value)
 
-    measured_state = observe(state)
+    measurement = observe(state)
+    observer = None if sensor is None else ModelPredictiveObserver(nominal.plant, measurement)
+    control_state = measurement.copy() if observer is None else observer.estimate.copy()
     times: list[float] = []
     states: list[np.ndarray] = []
     commands: list[float] = []
@@ -176,16 +198,17 @@ def simulate_adaptive_hybrid(
 
     for index in range(identify_steps):
         command = trajectory_feedback_command(
-            measured_state,
+            control_state,
             nominal.optimization.states[:, index],
             float(nominal.optimization.commands_nm[index]),
             nominal.tvlqr[index],
             simulation_plant.config.max_torque_nm,
         )
-        measured_before = measured_state.copy()
+        measured_before = measurement.copy()
         state = simulation_plant.step(state, command)
-        measured_state = observe(state)
-        estimator.update(measured_before, command, measured_state)
+        measurement = observe(state)
+        estimator.update(measured_before, command, measurement)
+        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
         times.append((index + 1) * dt)
         states.append(state.copy())
         commands.append(command)
@@ -195,17 +218,20 @@ def simulate_adaptive_hybrid(
     selected = library[selected_name]
     if selected.optimization.commands_nm.size != nominal.optimization.commands_nm.size:
         raise ValueError("adaptive library trajectories must share one horizon")
+    if observer is not None:
+        observer.set_plant(selected.plant)
 
     for index in range(identify_steps, selected.optimization.commands_nm.size):
         command = trajectory_feedback_command(
-            measured_state,
+            control_state,
             selected.optimization.states[:, index],
             float(selected.optimization.commands_nm[index]),
             selected.tvlqr[index],
             simulation_plant.config.max_torque_nm,
         )
         state = simulation_plant.step(state, command)
-        measured_state = observe(state)
+        measurement = observe(state)
+        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
         times.append((index + 1) * dt)
         states.append(state.copy())
         commands.append(command)
@@ -215,13 +241,14 @@ def simulate_adaptive_hybrid(
     total_steps = int(round(total_s / dt))
     while len(states) < total_steps:
         command = lqr_command(
-            measured_state,
+            control_state,
             selected.optimization.target_state,
             selected.upright_lqr,
             simulation_plant.config.max_torque_nm,
         )
         state = simulation_plant.step(state, command)
-        measured_state = observe(state)
+        measurement = observe(state)
+        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
         times.append((len(states) + 1) * dt)
         states.append(state.copy())
         commands.append(command)
