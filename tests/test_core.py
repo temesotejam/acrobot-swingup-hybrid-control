@@ -4,6 +4,7 @@ import math
 
 import numpy as np
 
+from acrobot_hybrid.adaptive import ModelBankEstimator, candidate_physics_models
 from acrobot_hybrid.controllers import (
     lqr_command,
     numerical_discrete_linearization,
@@ -73,3 +74,29 @@ def test_robustness_scenario_groups_are_explicit() -> None:
     assert groups.count("initial-state") == 8
     assert groups.count("model-mismatch") == 8
     assert groups.count("stress") == 4
+
+
+def test_model_bank_matches_model_mismatch_uncertainty_set() -> None:
+    models = candidate_physics_models(PhysicsConfig())
+    assert len(models) == 9
+    assert "nominal" in models
+    scenario_names = {
+        item.name for item in default_robustness_scenarios(PhysicsConfig())
+        if item.group == "model-mismatch"
+    }
+    assert scenario_names == set(models) - {"nominal"}
+
+
+def test_model_bank_estimator_selects_exact_transition_model() -> None:
+    models = candidate_physics_models(PhysicsConfig())
+    state = np.array([0.7, -0.6, 1.2, -0.8, 0.3], dtype=np.float64)
+    commands = [0.8, -0.4, 0.2]
+    for expected_name, config in models.items():
+        actual = AcrobotPlant(config, wrap_angles=False)
+        estimator = ModelBankEstimator(models)
+        current = state.copy()
+        for command in commands:
+            next_state = actual.step(current, command)
+            estimator.update(current, command, next_state)
+            current = next_state
+        assert estimator.selected_model() == expected_name
