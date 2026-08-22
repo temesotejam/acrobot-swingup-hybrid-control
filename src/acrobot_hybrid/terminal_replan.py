@@ -22,17 +22,27 @@ def _soft_terminal_replan(
     start_state: np.ndarray,
     reference: OptimizationResult,
     start_index: int,
+    extension_s: float = 0.0,
 ) -> OptimizationResult:
-    """Feasible short-horizon nonlinear replan with a strong soft terminal cost."""
+    """Feasible nonlinear replan with an optional upright-settle extension."""
     p = plant.config
     start_index = int(start_index)
-    ref_states = np.asarray(reference.states[:, start_index:], dtype=np.float64)
-    ref_commands = np.asarray(reference.commands_nm[start_index:], dtype=np.float64)
+    target = np.asarray(reference.target_state, dtype=np.float64).copy()
+    ref_states = np.asarray(reference.states[:, start_index:], dtype=np.float64).copy()
+    ref_commands = np.asarray(reference.commands_nm[start_index:], dtype=np.float64).copy()
+
+    extension_steps = max(0, int(round(float(extension_s) / p.dt_s)))
+    if extension_steps:
+        ref_states = np.concatenate(
+            [ref_states, np.repeat(target[:, None], extension_steps, axis=1)],
+            axis=1,
+        )
+        ref_commands = np.concatenate([ref_commands, np.zeros(extension_steps, dtype=np.float64)])
+
     steps = ref_commands.size
     if steps < 10:
         raise ValueError("terminal replan needs at least 10 steps")
     start = np.asarray(start_state, dtype=np.float64).copy()
-    target = np.asarray(reference.target_state, dtype=np.float64).copy()
 
     opti = ca.Opti()
     x = opti.variable(5, steps + 1)
@@ -44,19 +54,25 @@ def _soft_terminal_replan(
 
     terminal = x[:, -1] - ca.DM(target)
     objective = (
-        120000.0 * terminal[0] ** 2
-        + 70000.0 * terminal[1] ** 2
-        + 18000.0 * terminal[2] ** 2
-        + 10000.0 * terminal[3] ** 2
-        + 1200.0 * terminal[4] ** 2
+        160000.0 * terminal[0] ** 2
+        + 90000.0 * terminal[1] ** 2
+        + 24000.0 * terminal[2] ** 2
+        + 14000.0 * terminal[3] ** 2
+        + 1600.0 * terminal[4] ** 2
     )
-    settle_start = max(0, steps - int(round(1.0 / p.dt_s)))
+    settle_start = max(0, steps - int(round(2.0 / p.dt_s)))
     for index in range(steps):
         command_error = u[0, index] - float(ref_commands[index])
         objective += 0.002 * command_error**2
         if index >= settle_start:
             settle = x[:, index] - ca.DM(target)
-            objective += 80.0 * settle[0] ** 2 + 45.0 * settle[1] ** 2 + 14.0 * settle[2] ** 2 + 8.0 * settle[3] ** 2
+            objective += (
+                180.0 * settle[0] ** 2
+                + 100.0 * settle[1] ** 2
+                + 28.0 * settle[2] ** 2
+                + 16.0 * settle[3] ** 2
+                + 2.0 * settle[4] ** 2
+            )
     opti.minimize(objective)
 
     offset = start - ref_states[:, 0]
@@ -65,7 +81,7 @@ def _soft_terminal_replan(
         guess_states[:, index] += (1.0 - index / steps) * offset
     opti.set_initial(x, guess_states)
     opti.set_initial(u, np.clip(ref_commands, -p.max_torque_nm, p.max_torque_nm).reshape(1, -1))
-    _configure_solver(opti, max_iter=800)
+    _configure_solver(opti, max_iter=900)
     solution = opti.solve()
     return OptimizationResult(
         states=np.asarray(solution.value(x), dtype=np.float64),
@@ -92,23 +108,36 @@ def _wrapped_error(value: float, target: float) -> float:
     return math.atan2(math.sin(value - target), math.cos(value - target))
 
 
-def _upright_lqr_ready(plant: AcrobotPlant, state: np.ndarray, target: np.ndarray) -> bool:
-    """Conservative entry set for the noisy upright regulator.
+def _upright_lqr_ready(
+    plant: AcrobotPlant,
+    state: np.ndarray,
+    target: np.ndarray,
+    gain: np.ndarray,
+) -> bool:
+    """Empirically verified local entry set for the torque-limited LQR.
 
-    The benchmark Capture metric is deliberately broad, so it is not a safe
-    switching condition for a local LQR.  This supervisor instead requires
-    direct joint-angle proximity, low joint speed and high tip height for a
-    short dwell before handing control to the upright regulator.
+    Run #23 showed that the benchmark Capture set is far larger than the true
+    local LQR basin: even perfect-state feedback failed from the fixed 21 s
+    handoff.  The component bounds below were checked across all eight holdout
+    parameter plants.  The additional unsaturated-command check keeps the
+    handoff inside the part of that box where the linear regulator still has
+    useful torque margin.
     """
     state = np.asarray(state, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
+    error = state - target
+    error = error.copy()
+    error[0] = _wrapped_error(float(state[0]), float(target[0]))
+    error[1] = _wrapped_error(float(state[1]), float(target[1]))
+    requested = float((gain @ error)[0])
     return bool(
-        plant.tip_height_m(state) >= 1.90
-        and abs(_wrapped_error(float(state[0]), float(target[0]))) <= math.radians(12.0)
-        and abs(_wrapped_error(float(state[1]), float(target[1]))) <= math.radians(15.0)
-        and abs(float(state[2])) <= 0.40
-        and abs(float(state[3])) <= 0.60
-        and abs(float(state[4])) <= 0.60
+        plant.tip_height_m(state) >= 1.995
+        and abs(float(error[0])) <= math.radians(0.5)
+        and abs(float(error[1])) <= math.radians(2.0)
+        and abs(float(error[2])) <= 0.02
+        and abs(float(error[3])) <= 0.05
+        and abs(float(error[4])) <= 0.10
+        and abs(requested) <= 0.80 * plant.config.max_torque_nm
     )
 
 
@@ -125,14 +154,20 @@ def simulate_terminal_replan_hybrid(
     capture_supervisor: bool = False,
     capture_supervisor_start_s: float = 18.0,
     capture_supervisor_dwell_s: float = 0.20,
+    recovery_replan_s: float = 19.5,
+    recovery_extension_s: float = 2.5,
 ) -> AdaptiveSimulationResult:
-    """Adaptive TVLQR with late re-identification and one nonlinear MPC replan.
+    """Adaptive TVLQR with late identification and one recovery replan.
 
-    ``hold_state_source`` is also used for diagnosis under noisy sensing:
-    ``true`` isolates the regulator from estimation error, ``measurement``
-    uses the bias-corrected raw state measurement, and ``ekf`` uses the
-    nonlinear process-model EKF.  ``capture_supervisor`` replaces the fixed
-    end-of-trajectory handoff with a conservative state-and-dwell gate.
+    Noisy supervised trials first replan at ``replan_start_s``.  If the state
+    has not entered the verified local-LQR basin by ``recovery_replan_s``, the
+    estimator is updated with the intervening transitions, the dynamics model
+    is selected again, and a second nonlinear replan is solved with an upright
+    settle extension.  LQR handoff occurs only after a short in-basin dwell.
+
+    ``hold_state_source`` remains available for diagnosis: ``true`` isolates
+    the regulator from estimation error, ``measurement`` uses the calibrated
+    raw measurement, and ``ekf`` uses the nonlinear process-model EKF.
     """
     if "nominal" not in library:
         raise ValueError("adaptive library must contain nominal")
@@ -206,8 +241,8 @@ def simulate_terminal_replan_hybrid(
         commands.append(command)
         modes.append("adaptive-tvlqr")
 
-    late_estimate = estimator.continuous_estimate(nominal.plant.config)
-    selected = _interpolated_library_entry(library, late_estimate)
+    selected_estimate = estimator.continuous_estimate(nominal.plant.config)
+    selected = _interpolated_library_entry(library, selected_estimate)
     if observer is not None:
         observer.set_plant(selected.plant)
 
@@ -222,6 +257,9 @@ def simulate_terminal_replan_hybrid(
 
     required_ready_steps = max(1, int(round(capture_supervisor_dwell_s / dt)))
     ready_streak = 0
+    lqr_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
+    recovery_triggered = False
+
     for local_index, nominal_command in enumerate(replan.commands_nm):
         command = trajectory_feedback_command(
             control_state,
@@ -230,23 +268,77 @@ def simulate_terminal_replan_hybrid(
             replan_gains[local_index],
             simulation_plant.config.max_torque_nm,
         )
+        before = measurement.copy()
         state = simulation_plant.step(state, command)
         measurement = observe(state)
+        estimator.update(before, command, measurement)
         control_state = measurement.copy() if observer is None else observer.update(command, measurement)
-        global_index = replan_index + local_index
-        times.append((global_index + 1) * dt)
+        global_time_s = len(states) * dt + dt
+        times.append(global_time_s)
         states.append(state.copy())
         commands.append(command)
         modes.append(replan_mode)
 
-        if capture_supervisor and (global_index + 1) * dt >= capture_supervisor_start_s:
+        if capture_supervisor and global_time_s >= capture_supervisor_start_s:
             ready_streak = (
                 ready_streak + 1
-                if _upright_lqr_ready(selected.plant, control_state, replan.target_state)
+                if _upright_lqr_ready(selected.plant, control_state, replan.target_state, lqr_gain)
                 else 0
             )
             if ready_streak >= required_ready_steps:
                 break
+            if global_time_s >= recovery_replan_s:
+                recovery_triggered = True
+                break
+
+    if capture_supervisor and recovery_triggered and ready_streak < required_ready_steps:
+        selected_estimate = estimator.continuous_estimate(nominal.plant.config)
+        selected = _interpolated_library_entry(library, selected_estimate)
+        if observer is not None:
+            observer.set_plant(selected.plant)
+        recovery_index = min(len(states), selected.optimization.commands_nm.size - 10)
+        try:
+            recovery = _soft_terminal_replan(
+                selected.plant,
+                control_state,
+                selected.optimization,
+                recovery_index,
+                extension_s=recovery_extension_s,
+            )
+            recovery_gains = tvlqr_gains(selected.plant, recovery.states, recovery.commands_nm)
+            recovery_mode = "recovery-replan"
+        except RuntimeError:
+            recovery = _reference_tail(selected.optimization, recovery_index)
+            recovery_gains = selected.tvlqr[recovery_index:].copy()
+            recovery_mode = "recovery-fallback"
+
+        lqr_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
+        ready_streak = 0
+        for local_index, nominal_command in enumerate(recovery.commands_nm):
+            command = trajectory_feedback_command(
+                control_state,
+                recovery.states[:, local_index],
+                float(nominal_command),
+                recovery_gains[local_index],
+                simulation_plant.config.max_torque_nm,
+            )
+            before = measurement.copy()
+            state = simulation_plant.step(state, command)
+            measurement = observe(state)
+            estimator.update(before, command, measurement)
+            control_state = measurement.copy() if observer is None else observer.update(command, measurement)
+            times.append((len(states) + 1) * dt)
+            states.append(state.copy())
+            commands.append(command)
+            modes.append(recovery_mode)
+
+            if _upright_lqr_ready(selected.plant, control_state, recovery.target_state, lqr_gain):
+                ready_streak += 1
+            else:
+                ready_streak = 0
+            if ready_streak >= required_ready_steps:
+                break
+        replan = recovery
 
     switch_time_s = len(states) * dt
     total_steps = int(round(total_s / dt))
@@ -275,10 +367,7 @@ def simulate_terminal_replan_hybrid(
         times.append((len(states) + 1) * dt)
         states.append(state.copy())
         commands.append(command)
-        if sensor is None:
-            modes.append("replan-lqr")
-        else:
-            modes.append(f"hold-{hold_state_source}")
+        modes.append("replan-lqr" if sensor is None else f"hold-{hold_state_source}")
 
     history = SimulationHistory(
         times_s=np.asarray(times, dtype=np.float64),
@@ -289,7 +378,7 @@ def simulate_terminal_replan_hybrid(
     )
     return AdaptiveSimulationResult(
         history=history,
-        selected_model=f"{late_estimate.family} alpha={late_estimate.alpha:+.3f}",
+        selected_model=f"{selected_estimate.family} alpha={selected_estimate.alpha:+.3f}",
         identification_errors=estimator.normalized_errors(),
         identification_steps=estimator.samples,
     )
