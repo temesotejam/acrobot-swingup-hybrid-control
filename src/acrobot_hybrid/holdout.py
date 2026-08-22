@@ -4,10 +4,11 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .adaptive import AdaptiveLibraryEntry, simulate_adaptive_hybrid
+from .adaptive import AdaptiveLibraryEntry
 from .evaluation import evaluate_history
 from .plant import AcrobotPlant, PhysicsConfig
 from .sensing import SensorNoiseConfig
+from .terminal_replan import simulate_terminal_replan_hybrid
 
 
 @dataclass(frozen=True)
@@ -49,20 +50,18 @@ def evaluate_holdout_robustness(
     noisy_seeds: tuple[int, ...] = (11, 22, 33),
     sensor_noise: SensorNoiseConfig | None = None,
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
-    """Evaluate bank-interior interpolation and noisy-state generalization."""
+    """Evaluate bank-interior parameters with late nonlinear terminal replanning."""
     sensor_noise = sensor_noise or SensorNoiseConfig()
-    identification_window_s = max(1.0, float(identification_s))
     rows: list[dict] = []
 
     for scenario in holdout_physics_models(nominal):
         actual_plant = AcrobotPlant(scenario.physics, wrap_angles=False)
-        clean = simulate_adaptive_hybrid(
+        clean = simulate_terminal_replan_hybrid(
             actual_plant,
             library,
-            identification_s=identification_window_s,
+            identification_s=max(1.0, float(identification_s)),
+            replan_start_s=18.0,
             total_s=40.0,
-            continuous_selection=True,
-            capture_supervisor=True,
         )
         clean_metrics = evaluate_history(actual_plant, clean.history.times_s, clean.history.states, clean.history.commands_nm)
         rows.append({
@@ -78,16 +77,15 @@ def evaluate_holdout_robustness(
         })
 
         for seed in noisy_seeds:
-            noisy = simulate_adaptive_hybrid(
+            noisy = simulate_terminal_replan_hybrid(
                 actual_plant,
                 library,
-                identification_s=identification_window_s,
+                identification_s=max(1.0, float(identification_s)),
+                replan_start_s=18.0,
                 total_s=40.0,
                 sensor_noise=sensor_noise,
                 sensor_seed=seed,
-                continuous_selection=True,
                 calibration_samples=50,
-                capture_supervisor=True,
             )
             noisy_metrics = evaluate_history(actual_plant, noisy.history.times_s, noisy.history.states, noisy.history.commands_nm)
             rows.append({
