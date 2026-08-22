@@ -23,8 +23,10 @@ def _soft_terminal_replan(
     reference: OptimizationResult,
     start_index: int,
     extension_s: float = 0.0,
+    basin_gain: np.ndarray | None = None,
+    basin_dwell_s: float = 0.0,
 ) -> OptimizationResult:
-    """Feasible nonlinear replan with an optional upright-settle extension."""
+    """Feasible nonlinear replan with optional hard local-LQR entry constraints."""
     p = plant.config
     start_index = int(start_index)
     target = np.asarray(reference.target_state, dtype=np.float64).copy()
@@ -73,6 +75,28 @@ def _soft_terminal_replan(
                 + 16.0 * settle[3] ** 2
                 + 2.0 * settle[4] ** 2
             )
+
+    if basin_gain is not None and basin_dwell_s > 0.0:
+        gain_dm = ca.DM(np.asarray(basin_gain, dtype=np.float64).reshape(1, 5))
+        basin_steps = max(1, int(round(float(basin_dwell_s) / p.dt_s)))
+        basin_start = max(0, steps - basin_steps)
+        for index in range(basin_start, steps + 1):
+            basin_error = x[:, index] - ca.DM(target)
+            # Stay comfortably inside the empirically verified handoff set.
+            opti.subject_to(opti.bounded(-math.radians(0.40), basin_error[0], math.radians(0.40)))
+            opti.subject_to(opti.bounded(-math.radians(1.50), basin_error[1], math.radians(1.50)))
+            opti.subject_to(opti.bounded(-0.015, basin_error[2], 0.015))
+            opti.subject_to(opti.bounded(-0.040, basin_error[3], 0.040))
+            opti.subject_to(opti.bounded(-0.080, basin_error[4], 0.080))
+            requested = ca.mtimes(gain_dm, basin_error)
+            opti.subject_to(
+                opti.bounded(
+                    -0.70 * p.max_torque_nm,
+                    requested,
+                    0.70 * p.max_torque_nm,
+                )
+            )
+
     opti.minimize(objective)
 
     offset = start - ref_states[:, 0]
@@ -81,7 +105,7 @@ def _soft_terminal_replan(
         guess_states[:, index] += (1.0 - index / steps) * offset
     opti.set_initial(x, guess_states)
     opti.set_initial(u, np.clip(ref_commands, -p.max_torque_nm, p.max_torque_nm).reshape(1, -1))
-    _configure_solver(opti, max_iter=900)
+    _configure_solver(opti, max_iter=1000)
     solution = opti.solve()
     return OptimizationResult(
         states=np.asarray(solution.value(x), dtype=np.float64),
@@ -114,15 +138,7 @@ def _upright_lqr_ready(
     target: np.ndarray,
     gain: np.ndarray,
 ) -> bool:
-    """Empirically verified local entry set for the torque-limited LQR.
-
-    Run #23 showed that the benchmark Capture set is far larger than the true
-    local LQR basin: even perfect-state feedback failed from the fixed 21 s
-    handoff.  The component bounds below were checked across all eight holdout
-    parameter plants.  The additional unsaturated-command check keeps the
-    handoff inside the part of that box where the linear regulator still has
-    useful torque margin.
-    """
+    """Empirically verified local entry set for the torque-limited LQR."""
     state = np.asarray(state, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     error = state - target
@@ -157,26 +173,16 @@ def simulate_terminal_replan_hybrid(
     recovery_replan_s: float = 19.5,
     recovery_extension_s: float = 2.5,
 ) -> AdaptiveSimulationResult:
-    """Adaptive TVLQR with late identification and one recovery replan.
-
-    Noisy supervised trials first replan at ``replan_start_s``.  If the state
-    has not entered the verified local-LQR basin by ``recovery_replan_s``, the
-    estimator is updated with the intervening transitions, the dynamics model
-    is selected again, and a second nonlinear replan is solved with an upright
-    settle extension.  LQR handoff occurs only after a short in-basin dwell.
-
-    ``hold_state_source`` remains available for diagnosis: ``true`` isolates
-    the regulator from estimation error, ``measurement`` uses the calibrated
-    raw measurement, and ``ekf`` uses the nonlinear process-model EKF.
-    """
+    """Adaptive TVLQR with a local-data, basin-constrained recovery replan."""
     if "nominal" not in library:
         raise ValueError("adaptive library must contain nominal")
     if hold_state_source not in {"true", "measurement", "ekf"}:
         raise ValueError("hold_state_source must be 'true', 'measurement' or 'ekf'")
 
     nominal = library["nominal"]
+    model_configs = {name: entry.plant.config for name, entry in library.items()}
     dt = simulation_plant.config.dt_s
-    estimator = ModelBankEstimator({name: entry.plant.config for name, entry in library.items()})
+    estimator = ModelBankEstimator(model_configs)
     identify_steps = int(round(identification_s / dt))
     replan_index = int(round(replan_start_s / dt))
     replan_index = max(identify_steps + 1, min(replan_index, nominal.optimization.commands_nm.size - 10))
@@ -255,6 +261,12 @@ def simulate_terminal_replan_hybrid(
         replan_gains = selected.tvlqr[replan_index:].copy()
         replan_mode = "replan-fallback"
 
+    # Recovery identification intentionally starts here. Run #26 showed that
+    # extending the original 0--19.5 s rollout score can make the selected
+    # uncertainty family drift under sensor noise. The terminal segment is
+    # dynamically informative and short enough for open-loop model rollout to
+    # remain meaningful.
+    recovery_estimator = ModelBankEstimator(model_configs)
     required_ready_steps = max(1, int(round(capture_supervisor_dwell_s / dt)))
     ready_streak = 0
     lqr_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
@@ -272,6 +284,7 @@ def simulate_terminal_replan_hybrid(
         state = simulation_plant.step(state, command)
         measurement = observe(state)
         estimator.update(before, command, measurement)
+        recovery_estimator.update(before, command, measurement)
         control_state = measurement.copy() if observer is None else observer.update(command, measurement)
         global_time_s = len(states) * dt + dt
         times.append(global_time_s)
@@ -292,11 +305,21 @@ def simulate_terminal_replan_hybrid(
                 break
 
     if capture_supervisor and recovery_triggered and ready_streak < required_ready_steps:
-        selected_estimate = estimator.continuous_estimate(nominal.plant.config)
+        # Use only the recent terminal-tracking segment for the recovery model.
+        # This prevents the long-horizon noisy rollout from dominating a late
+        # decision, while still retaining bias cancellation through state
+        # differences inside ModelBankEstimator.
+        if recovery_estimator.samples >= max(10, int(round(0.5 / dt))):
+            selected_estimate = recovery_estimator.continuous_estimate(nominal.plant.config)
+        else:
+            selected_estimate = estimator.continuous_estimate(nominal.plant.config)
         selected = _interpolated_library_entry(library, selected_estimate)
         if observer is not None:
             observer.set_plant(selected.plant)
+
         recovery_index = min(len(states), selected.optimization.commands_nm.size - 10)
+        recovery_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
+
         try:
             recovery = _soft_terminal_replan(
                 selected.plant,
@@ -304,15 +327,31 @@ def simulate_terminal_replan_hybrid(
                 selected.optimization,
                 recovery_index,
                 extension_s=recovery_extension_s,
+                basin_gain=recovery_gain,
+                basin_dwell_s=capture_supervisor_dwell_s,
             )
             recovery_gains = tvlqr_gains(selected.plant, recovery.states, recovery.commands_nm)
-            recovery_mode = "recovery-replan"
+            recovery_mode = "recovery-basin"
         except RuntimeError:
-            recovery = _reference_tail(selected.optimization, recovery_index)
-            recovery_gains = selected.tvlqr[recovery_index:].copy()
-            recovery_mode = "recovery-fallback"
+            # A hard basin can be infeasible for a badly estimated model. Keep
+            # an extended soft replan as a controlled fallback instead of
+            # dropping immediately to the original trajectory tail.
+            try:
+                recovery = _soft_terminal_replan(
+                    selected.plant,
+                    control_state,
+                    selected.optimization,
+                    recovery_index,
+                    extension_s=recovery_extension_s,
+                )
+                recovery_gains = tvlqr_gains(selected.plant, recovery.states, recovery.commands_nm)
+                recovery_mode = "recovery-soft"
+            except RuntimeError:
+                recovery = _reference_tail(selected.optimization, recovery_index)
+                recovery_gains = selected.tvlqr[recovery_index:].copy()
+                recovery_mode = "recovery-fallback"
 
-        lqr_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
+        lqr_gain = recovery_gain
         ready_streak = 0
         for local_index, nominal_command in enumerate(recovery.commands_nm):
             command = trajectory_feedback_command(
