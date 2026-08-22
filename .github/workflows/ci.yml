@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  MPLBACKEND: Agg
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Unit tests
+        run: python -m pytest -q
+
+  hybrid-benchmark:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+      - name: Optimize and simulate
+        run: python -m acrobot_hybrid.run --output-dir results
+      - name: Verify control result
+        run: |
+          test -f results/summary.json
+          test -f results/summary.md
+          test -f results/nominal_trajectory.npz
+          test -f results/trajectory.csv
+          test -f results/videos/hybrid.mp4
+          test -f results/plots/states.png
+          test -f results/plots/height.png
+          test -f results/plots/torque.png
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s = json.loads(Path('results/summary.json').read_text())
+          m = s['metrics']
+          assert s['success'] is True
+          assert m['capture'] is True
+          assert m['final_stable'] is True
+          assert m['final_2s_stable_ratio'] >= 0.80
+          assert m['final_tip_height_m'] > 1.99
+          assert abs(m['final_theta1_error_deg']) < 0.5
+          assert abs(m['final_theta2_error_deg']) < 0.5
+          terminal = s['optimizer_terminal']
+          assert abs(terminal['theta1_error_deg']) < 1.0
+          assert abs(terminal['theta2_error_deg']) < 1.0
+          assert abs(terminal['dtheta1_rad_s']) < 0.10
+          assert abs(terminal['dtheta2_rad_s']) < 0.10
+          PY
+      - name: Build Pages preview
+        run: |
+          python web/build_pages.py --results results --output site --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          test -f site/index.html
+          test -f site/videos/hybrid.mp4
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hybrid-control-${{ github.run_number }}
+          path: results/
+          retention-days: 30
