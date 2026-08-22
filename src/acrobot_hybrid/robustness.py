@@ -24,8 +24,8 @@ def default_robustness_scenarios(nominal: PhysicsConfig) -> list[RobustnessScena
     zero = np.zeros(5, dtype=np.float64)
     scenarios: list[RobustnessScenario] = []
 
-    def initial(name: str, state: list[float]) -> None:
-        scenarios.append(RobustnessScenario(name, "initial-state", np.asarray(state, dtype=np.float64), nominal))
+    def initial(name: str, state: list[float], group: str = "initial-state") -> None:
+        scenarios.append(RobustnessScenario(name, group, np.asarray(state, dtype=np.float64), nominal))
 
     initial("theta1 +2 deg", [math.radians(2.0), 0.0, 0.0, 0.0, 0.0])
     initial("theta1 -2 deg", [-math.radians(2.0), 0.0, 0.0, 0.0, 0.0])
@@ -98,11 +98,10 @@ def default_robustness_scenarios(nominal: PhysicsConfig) -> list[RobustnessScena
         ),
     )
 
-    initial("theta1 +5 deg stress", [math.radians(5.0), 0.0, 0.0, 0.0, 0.0])
-    initial("theta1 -5 deg stress", [-math.radians(5.0), 0.0, 0.0, 0.0, 0.0])
-    initial("theta2 +5 deg stress", [0.0, math.radians(5.0), 0.0, 0.0, 0.0])
-    initial("theta2 -5 deg stress", [0.0, -math.radians(5.0), 0.0, 0.0, 0.0])
-    scenarios[-4:] = [RobustnessScenario(item.name, "stress", item.initial_state, item.physics) for item in scenarios[-4:]]
+    initial("theta1 +5 deg stress", [math.radians(5.0), 0.0, 0.0, 0.0, 0.0], "stress")
+    initial("theta1 -5 deg stress", [-math.radians(5.0), 0.0, 0.0, 0.0, 0.0], "stress")
+    initial("theta2 +5 deg stress", [0.0, math.radians(5.0), 0.0, 0.0, 0.0], "stress")
+    initial("theta2 -5 deg stress", [0.0, -math.radians(5.0), 0.0, 0.0, 0.0], "stress")
     return scenarios
 
 
@@ -110,8 +109,10 @@ def evaluate_robustness(
     nominal_plant: AcrobotPlant,
     optimization: OptimizationResult,
     hold_s: float = 19.0,
+    gains: np.ndarray | None = None,
 ) -> tuple[list[dict], dict]:
-    gains = tvlqr_gains(nominal_plant, optimization.states, optimization.commands_nm)
+    if gains is None:
+        gains = tvlqr_gains(nominal_plant, optimization.states, optimization.commands_nm)
     rows: list[dict] = []
     for scenario in default_robustness_scenarios(nominal_plant.config):
         actual_plant = AcrobotPlant(scenario.physics, wrap_angles=False)
