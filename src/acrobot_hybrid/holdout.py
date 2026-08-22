@@ -7,6 +7,7 @@ import numpy as np
 from .adaptive import AdaptiveLibraryEntry
 from .evaluation import evaluate_history
 from .plant import AcrobotPlant, PhysicsConfig
+from .receding import simulate_receding_recovery_hybrid
 from .sensing import SensorNoiseConfig
 from .terminal_replan import simulate_terminal_replan_hybrid
 
@@ -73,12 +74,16 @@ def evaluate_holdout_robustness(
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
     """Evaluate bank-interior parameters under clean and noisy sensing.
 
-    Primary noisy trials use late re-identification, a recovery nonlinear
-    replan when needed, and an empirically verified LQR-basin handoff.  Run
-    #23 already showed that true-state, raw-measurement and EKF fixed handoffs
-    all fail in the representative motor-tau holdout.  We therefore retain
-    only the perfect-state fixed-handoff control as the diagnostic baseline so
-    CI time is spent on the 24 primary noisy recovery trials.
+    Clean cases retain the historical terminal-replan path. Primary noisy
+    cases use receding nonlinear recovery: the long-window model is frozen at
+    18 s, a basin-constrained plan is executed for only 0.75 s, and the plan is
+    rebuilt from the latest filtered state up to four times. The upright LQR is
+    unreachable from code unless the verified local entry set is actually held
+    for 0.20 s.
+
+    The representative perfect-state fixed-handoff case remains as a control
+    showing that the historical 21 s handoff state itself lies outside the
+    local regulator basin.
     """
     sensor_noise = sensor_noise or SensorNoiseConfig()
     rows: list[dict] = []
@@ -96,19 +101,20 @@ def evaluate_holdout_robustness(
         rows.append(_result_row(scenario, "clean-holdout", -1, actual_plant, clean))
 
         for seed in noisy_seeds:
-            noisy = simulate_terminal_replan_hybrid(
+            noisy = simulate_receding_recovery_hybrid(
                 actual_plant,
                 library,
                 identification_s=max(1.0, float(identification_s)),
                 replan_start_s=18.0,
+                recovery_start_s=19.5,
                 total_s=40.0,
                 sensor_noise=sensor_noise,
                 sensor_seed=seed,
                 calibration_samples=50,
-                hold_state_source="ekf",
-                capture_supervisor=True,
-                capture_supervisor_start_s=18.0,
                 capture_supervisor_dwell_s=0.20,
+                recovery_extension_s=2.0,
+                mpc_apply_s=0.75,
+                max_recovery_cycles=4,
             )
             noisy_row = _result_row(scenario, "noisy-holdout", seed, actual_plant, noisy)
             rows.append(noisy_row)
