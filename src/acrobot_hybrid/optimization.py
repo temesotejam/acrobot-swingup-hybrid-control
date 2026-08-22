@@ -70,17 +70,20 @@ def _rk4(x, u, p: PhysicsConfig):
     return x + h * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
 
 
+def _configure_solver(opti: ca.Opti, max_iter: int = 1600) -> None:
+    opti.solver(
+        "ipopt",
+        {"expand": True, "print_time": False},
+        {"max_iter": max_iter, "print_level": 0, "sb": "yes", "tol": 1e-6, "acceptable_tol": 1e-4},
+    )
+
+
 def optimize_nominal_trajectory(
     plant: AcrobotPlant,
     horizon_s: float = 21.0,
     nominal_torque_limit_nm: float = 0.98,
 ) -> OptimizationResult:
-    """Optimize a swing-up trajectory while reserving actuator feedback headroom.
-
-    The physical actuator remains limited to +/-1 N m.  The nominal trajectory
-    deliberately uses a slightly smaller bound so TVLQR can correct state
-    errors instead of immediately saturating at the open-loop command limit.
-    """
+    """Optimize a swing-up trajectory while reserving actuator feedback headroom."""
     seed_states, seed_commands = generate_energy_seed(plant, horizon_s=horizon_s)
     p = plant.config
     steps = seed_commands.size
@@ -126,11 +129,78 @@ def optimize_nominal_trajectory(
 
     opti.set_initial(x, seed_states.T)
     opti.set_initial(u, np.clip(seed_commands, -torque_limit, torque_limit).reshape(1, -1))
-    opti.solver(
-        "ipopt",
-        {"expand": True, "print_time": False},
-        {"max_iter": 1600, "print_level": 0, "sb": "yes", "tol": 1e-6, "acceptable_tol": 1e-4},
+    _configure_solver(opti)
+    solution = opti.solve()
+    return OptimizationResult(
+        states=np.asarray(solution.value(x), dtype=np.float64),
+        commands_nm=np.asarray(solution.value(u), dtype=np.float64).reshape(-1),
+        target_state=target,
+        objective=float(solution.value(objective)),
+        solver_status=str(opti.stats().get("return_status", "unknown")),
+        nominal_torque_limit_nm=torque_limit,
     )
+
+
+def refine_trajectory_for_model(
+    plant: AcrobotPlant,
+    reference: OptimizationResult,
+    nominal_torque_limit_nm: float = 0.99,
+    terminal_angle_tolerance_deg: float = 0.5,
+    terminal_velocity_tolerance_rad_s: float = 0.05,
+    terminal_torque_tolerance_nm: float = 0.10,
+) -> OptimizationResult:
+    """Re-optimize a known-good swing-up for a nearby model.
+
+    The nominal optimized trajectory is used as the warm start and regularizing
+    reference.  Hard terminal constraints force every library trajectory into
+    the local upright-controller basin instead of accepting a merely high tip.
+    """
+    p = plant.config
+    steps = reference.commands_nm.size
+    if reference.states.shape != (5, steps + 1):
+        raise ValueError("reference trajectory shape is inconsistent")
+    torque_limit = float(nominal_torque_limit_nm)
+    if not 0.0 < torque_limit <= p.max_torque_nm:
+        raise ValueError("nominal_torque_limit_nm must be within the physical torque bound")
+
+    target = np.asarray(reference.target_state, dtype=np.float64).copy()
+    opti = ca.Opti()
+    x = opti.variable(5, steps + 1)
+    u = opti.variable(1, steps)
+    opti.subject_to(x[:, 0] == ca.DM.zeros(5, 1))
+    for index in range(steps):
+        opti.subject_to(x[:, index + 1] == _rk4(x[:, index], u[:, index], p))
+    opti.subject_to(opti.bounded(-torque_limit, u, torque_limit))
+
+    terminal = x[:, -1] - ca.DM(target)
+    angle_tol = math.radians(float(terminal_angle_tolerance_deg))
+    velocity_tol = float(terminal_velocity_tolerance_rad_s)
+    torque_tol = float(terminal_torque_tolerance_nm)
+    opti.subject_to(opti.bounded(-angle_tol, terminal[0], angle_tol))
+    opti.subject_to(opti.bounded(-angle_tol, terminal[1], angle_tol))
+    opti.subject_to(opti.bounded(-velocity_tol, terminal[2], velocity_tol))
+    opti.subject_to(opti.bounded(-velocity_tol, terminal[3], velocity_tol))
+    opti.subject_to(opti.bounded(-torque_tol, terminal[4], torque_tol))
+
+    objective = (
+        1500.0 * terminal[0] ** 2
+        + 800.0 * terminal[1] ** 2
+        + 300.0 * terminal[2] ** 2
+        + 180.0 * terminal[3] ** 2
+        + 20.0 * terminal[4] ** 2
+    )
+    state_weights = np.array([0.05, 0.03, 0.01, 0.006, 0.001], dtype=np.float64)
+    for index in range(steps):
+        state_error = x[:, index] - ca.DM(reference.states[:, index])
+        command_error = u[0, index] - float(reference.commands_nm[index])
+        objective += 0.01 * command_error**2
+        for state_index, weight in enumerate(state_weights):
+            objective += float(weight) * state_error[state_index] ** 2
+    opti.minimize(objective)
+
+    opti.set_initial(x, reference.states)
+    opti.set_initial(u, np.clip(reference.commands_nm, -torque_limit, torque_limit).reshape(1, -1))
+    _configure_solver(opti, max_iter=1200)
     solution = opti.solve()
     return OptimizationResult(
         states=np.asarray(solution.value(x), dtype=np.float64),
