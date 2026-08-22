@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import math
 
 import numpy as np
 
-from .controllers import lqr_command, trajectory_feedback_command, tvlqr_gains, upright_lqr_gain
+from .controllers import (
+    lqr_command,
+    trajectory_feedback_command,
+    tvlqr_gains,
+    upright_discrete_lqr_gain,
+    upright_lqr_gain,
+)
 from .optimization import OptimizationResult, refine_trajectory_for_model
 from .plant import AcrobotPlant, PhysicsConfig
-from .sensing import ModelPredictiveObserver, NoisyStateSensor, SensorNoiseConfig
+from .sensing import ExtendedKalmanObserver, ModelPredictiveObserver, NoisyStateSensor, SensorNoiseConfig
 from .simulation import SimulationHistory
 
 
@@ -49,31 +54,15 @@ def interpolate_physics(nominal: PhysicsConfig, family: str, alpha: float) -> Ph
     alpha = float(np.clip(alpha, -1.0, 1.0))
     if family == "mass/inertia":
         scale = 1.0 + 0.02 * alpha
-        return replace(
-            nominal,
-            link_mass_1_kg=nominal.link_mass_1_kg * scale,
-            link_mass_2_kg=nominal.link_mass_2_kg * scale,
-            link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * scale,
-            link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * scale,
-        )
+        return replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * scale, link_mass_2_kg=nominal.link_mass_2_kg * scale, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * scale, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * scale)
     if family == "length/COM":
         scale = 1.0 + 0.01 * alpha
-        return replace(
-            nominal,
-            link_length_1_m=nominal.link_length_1_m * scale,
-            link_length_2_m=nominal.link_length_2_m * scale,
-            link_com_1_m=nominal.link_com_1_m * scale,
-            link_com_2_m=nominal.link_com_2_m * scale,
-        )
+        return replace(nominal, link_length_1_m=nominal.link_length_1_m * scale, link_length_2_m=nominal.link_length_2_m * scale, link_com_1_m=nominal.link_com_1_m * scale, link_com_2_m=nominal.link_com_2_m * scale)
     if family == "motor tau":
         return replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * (1.0 + 0.10 * alpha))
     if family == "joint damping":
         scale = 1.0 + 0.10 * alpha
-        return replace(
-            nominal,
-            joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * scale,
-            joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * scale,
-        )
+        return replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * scale, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * scale)
     raise ValueError(f"unknown uncertainty family: {family}")
 
 
@@ -120,8 +109,6 @@ class ModelBankEstimator:
         initial_observation = self.observations[0]
         for command, observed in zip(self.commands, self.observations[1:], strict=True):
             predicted = plant.step(predicted, command)
-            # Compare displacement from the initial observation. This cancels
-            # most static sensor bias while preserving dynamic mismatch signal.
             predicted_delta = predicted - self.initial_state
             observed_delta = observed - initial_observation
             residual = observed_delta - predicted_delta
@@ -139,11 +126,7 @@ class ModelBankEstimator:
         denominator = max(1, self.samples)
         return {name: float(value / denominator) for name, value in self._rollout_errors().items()}
 
-    def continuous_estimate(
-        self,
-        nominal: PhysicsConfig,
-        grid_points: int = 41,
-    ) -> ContinuousModelEstimate:
+    def continuous_estimate(self, nominal: PhysicsConfig, grid_points: int = 41) -> ContinuousModelEstimate:
         best: ContinuousModelEstimate | None = None
         for family in FAMILY_ENDPOINTS:
             for alpha in np.linspace(-1.0, 1.0, int(grid_points)):
@@ -157,56 +140,31 @@ class ModelBankEstimator:
         return best
 
 
-def build_adaptive_library(
-    nominal_plant: AcrobotPlant,
-    nominal_optimization: OptimizationResult,
-    candidate_torque_limit_nm: float = 0.99,
-) -> dict[str, AdaptiveLibraryEntry]:
+def build_adaptive_library(nominal_plant: AcrobotPlant, nominal_optimization: OptimizationResult, candidate_torque_limit_nm: float = 0.99) -> dict[str, AdaptiveLibraryEntry]:
     configs = candidate_physics_models(nominal_plant.config)
     library: dict[str, AdaptiveLibraryEntry] = {}
     for name, config in configs.items():
         plant = AcrobotPlant(config, wrap_angles=False)
-        if name == "nominal":
-            optimization = nominal_optimization
-        else:
-            optimization = refine_trajectory_for_model(
-                plant,
-                nominal_optimization,
-                nominal_torque_limit_nm=candidate_torque_limit_nm,
-            )
-        library[name] = AdaptiveLibraryEntry(
-            name=name,
-            plant=plant,
-            optimization=optimization,
-            tvlqr=tvlqr_gains(plant, optimization.states, optimization.commands_nm),
-            upright_lqr=upright_lqr_gain(plant),
-        )
+        optimization = nominal_optimization if name == "nominal" else refine_trajectory_for_model(plant, nominal_optimization, nominal_torque_limit_nm=candidate_torque_limit_nm)
+        library[name] = AdaptiveLibraryEntry(name=name, plant=plant, optimization=optimization, tvlqr=tvlqr_gains(plant, optimization.states, optimization.commands_nm), upright_lqr=upright_lqr_gain(plant))
     return library
 
 
-def _interpolated_library_entry(
-    library: dict[str, AdaptiveLibraryEntry],
-    estimate: ContinuousModelEstimate,
-) -> AdaptiveLibraryEntry:
+def _interpolated_library_entry(library: dict[str, AdaptiveLibraryEntry], estimate: ContinuousModelEstimate) -> AdaptiveLibraryEntry:
     nominal = library["nominal"]
     negative_name, positive_name = FAMILY_ENDPOINTS[estimate.family]
     endpoint = library[positive_name if estimate.alpha >= 0.0 else negative_name]
     weight = abs(float(estimate.alpha))
-    states = (1.0 - weight) * nominal.optimization.states + weight * endpoint.optimization.states
-    commands = (1.0 - weight) * nominal.optimization.commands_nm + weight * endpoint.optimization.commands_nm
     optimization = OptimizationResult(
-        states=states,
-        commands_nm=commands,
+        states=(1.0 - weight) * nominal.optimization.states + weight * endpoint.optimization.states,
+        commands_nm=(1.0 - weight) * nominal.optimization.commands_nm + weight * endpoint.optimization.commands_nm,
         target_state=nominal.optimization.target_state.copy(),
-        objective=float("nan"),
-        solver_status="interpolated",
+        objective=float("nan"), solver_status="interpolated",
         nominal_torque_limit_nm=(1.0 - weight) * nominal.optimization.nominal_torque_limit_nm + weight * endpoint.optimization.nominal_torque_limit_nm,
     )
     plant = AcrobotPlant(estimate.physics, wrap_angles=False)
     return AdaptiveLibraryEntry(
-        name=f"{estimate.family} alpha={estimate.alpha:+.3f}",
-        plant=plant,
-        optimization=optimization,
+        name=f"{estimate.family} alpha={estimate.alpha:+.3f}", plant=plant, optimization=optimization,
         tvlqr=(1.0 - weight) * nominal.tvlqr + weight * endpoint.tvlqr,
         upright_lqr=(1.0 - weight) * nominal.upright_lqr + weight * endpoint.upright_lqr,
     )
@@ -227,10 +185,6 @@ def simulate_adaptive_hybrid(
     if "nominal" not in library:
         raise ValueError("adaptive library must contain a nominal entry")
     dt = simulation_plant.config.dt_s
-    for entry in library.values():
-        if abs(entry.plant.config.dt_s - dt) > 1e-12:
-            raise ValueError("all library models must use the simulation dt")
-
     nominal = library["nominal"]
     models = {name: entry.plant.config for name, entry in library.items()}
     estimator = ModelBankEstimator(models)
@@ -240,8 +194,6 @@ def simulate_adaptive_hybrid(
 
     bias_estimate = np.zeros(5, dtype=np.float64)
     if sensor is not None and calibration_samples > 0:
-        # The experiment begins at a known, stationary downward state. Average
-        # a short pre-run calibration window to estimate episode-static bias.
         samples = np.asarray([sensor.observe(state) for _ in range(int(calibration_samples))])
         bias_estimate = np.mean(samples, axis=0) - state
 
@@ -250,87 +202,57 @@ def simulate_adaptive_hybrid(
         return raw - bias_estimate
 
     measurement = observe(state)
-    observer = None if sensor is None else ModelPredictiveObserver(nominal.plant, measurement)
-    control_state = measurement.copy() if observer is None else observer.estimate.copy()
+    swing_observer = None if sensor is None else ModelPredictiveObserver(nominal.plant, measurement)
+    control_state = measurement.copy() if swing_observer is None else swing_observer.estimate.copy()
     times: list[float] = []
     states: list[np.ndarray] = []
     commands: list[float] = []
     modes: list[str] = []
 
     for index in range(identify_steps):
-        command = trajectory_feedback_command(
-            control_state,
-            nominal.optimization.states[:, index],
-            float(nominal.optimization.commands_nm[index]),
-            nominal.tvlqr[index],
-            simulation_plant.config.max_torque_nm,
-        )
+        command = trajectory_feedback_command(control_state, nominal.optimization.states[:, index], float(nominal.optimization.commands_nm[index]), nominal.tvlqr[index], simulation_plant.config.max_torque_nm)
         measured_before = measurement.copy()
         state = simulation_plant.step(state, command)
         measurement = observe(state)
         estimator.update(measured_before, command, measurement)
-        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
-        times.append((index + 1) * dt)
-        states.append(state.copy())
-        commands.append(command)
-        modes.append("identify")
+        control_state = measurement.copy() if swing_observer is None else swing_observer.update(command, measurement)
+        times.append((index + 1) * dt); states.append(state.copy()); commands.append(command); modes.append("identify")
 
     if continuous_selection:
         estimate = estimator.continuous_estimate(nominal.plant.config)
         selected = _interpolated_library_entry(library, estimate)
         selected_name = selected.name
     else:
-        selected_name = estimator.selected_model()
-        selected = library[selected_name]
-
-    if selected.optimization.commands_nm.size != nominal.optimization.commands_nm.size:
-        raise ValueError("adaptive library trajectories must share one horizon")
-    if observer is not None:
-        observer.set_plant(selected.plant)
+        selected_name = estimator.selected_model(); selected = library[selected_name]
+    if swing_observer is not None:
+        swing_observer.set_plant(selected.plant)
 
     for index in range(identify_steps, selected.optimization.commands_nm.size):
-        command = trajectory_feedback_command(
-            control_state,
-            selected.optimization.states[:, index],
-            float(selected.optimization.commands_nm[index]),
-            selected.tvlqr[index],
-            simulation_plant.config.max_torque_nm,
-        )
+        command = trajectory_feedback_command(control_state, selected.optimization.states[:, index], float(selected.optimization.commands_nm[index]), selected.tvlqr[index], simulation_plant.config.max_torque_nm)
         state = simulation_plant.step(state, command)
         measurement = observe(state)
-        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
-        times.append((index + 1) * dt)
-        states.append(state.copy())
-        commands.append(command)
-        modes.append("adaptive-tvlqr")
+        control_state = measurement.copy() if swing_observer is None else swing_observer.update(command, measurement)
+        times.append((index + 1) * dt); states.append(state.copy()); commands.append(command); modes.append("adaptive-tvlqr")
 
     switch_time_s = selected.optimization.commands_nm.size * dt
     total_steps = int(round(total_s / dt))
+    if sensor is None:
+        hold_gain = selected.upright_lqr
+        hold_estimator = None
+    else:
+        hold_gain = upright_discrete_lqr_gain(selected.plant)
+        hold_estimator = ExtendedKalmanObserver(selected.plant, control_state, sensor_noise)
+
     while len(states) < total_steps:
-        command = lqr_command(
-            control_state,
-            selected.optimization.target_state,
-            selected.upright_lqr,
-            simulation_plant.config.max_torque_nm,
-        )
+        hold_state = control_state if hold_estimator is None else hold_estimator.estimate
+        command = lqr_command(hold_state, selected.optimization.target_state, hold_gain, simulation_plant.config.max_torque_nm)
         state = simulation_plant.step(state, command)
         measurement = observe(state)
-        control_state = measurement.copy() if observer is None else observer.update(command, measurement)
-        times.append((len(states) + 1) * dt)
-        states.append(state.copy())
-        commands.append(command)
-        modes.append("adaptive-lqr")
+        if hold_estimator is None:
+            control_state = measurement.copy()
+        else:
+            control_state = hold_estimator.update(command, measurement)
+        times.append((len(states) + 1) * dt); states.append(state.copy()); commands.append(command); modes.append("adaptive-lqr")
 
-    history = SimulationHistory(
-        times_s=np.asarray(times, dtype=np.float64),
-        states=np.asarray(states, dtype=np.float64),
-        commands_nm=np.asarray(commands, dtype=np.float64),
-        modes=np.asarray(modes, dtype="U24"),
-        switch_time_s=float(switch_time_s),
-    )
-    return AdaptiveSimulationResult(
-        history=history,
-        selected_model=selected_name,
-        identification_errors=estimator.normalized_errors(),
-        identification_steps=identify_steps,
-    )
+    history = SimulationHistory(times_s=np.asarray(times), states=np.asarray(states), commands_nm=np.asarray(commands), modes=np.asarray(modes, dtype="U24"), switch_time_s=float(switch_time_s))
+    return AdaptiveSimulationResult(history=history, selected_model=selected_name, identification_errors=estimator.normalized_errors(), identification_steps=identify_steps)
