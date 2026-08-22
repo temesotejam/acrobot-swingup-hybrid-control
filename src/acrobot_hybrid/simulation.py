@@ -51,12 +51,14 @@ def simulate_optimized_hybrid(
     optimization: OptimizationResult,
     hold_s: float = 19.0,
     initial_state: np.ndarray | None = None,
+    controller_plant: AcrobotPlant | None = None,
 ) -> SimulationHistory:
     """Open-loop optimized trajectory followed by local LQR.
 
-    This is retained as a robustness comparison baseline.  The nominal initial
-    state is exactly downward unless an explicit perturbation is supplied.
+    `controller_plant` can be fixed to the nominal model while `plant` is
+    perturbed, keeping model-mismatch comparisons honest.
     """
+    controller_plant = controller_plant or plant
     state = np.zeros(5, dtype=np.float64) if initial_state is None else np.asarray(initial_state, dtype=np.float64).copy()
     times: list[float] = []
     states: list[np.ndarray] = []
@@ -71,7 +73,7 @@ def simulate_optimized_hybrid(
         commands.append(float(command))
         modes.append("open-loop")
 
-    _finish_with_lqr(plant, plant, optimization, state, hold_s, times, states, commands, modes)
+    _finish_with_lqr(controller_plant, plant, optimization, state, hold_s, times, states, commands, modes)
     return SimulationHistory(
         times_s=np.asarray(times, dtype=np.float64),
         states=np.asarray(states, dtype=np.float64),
