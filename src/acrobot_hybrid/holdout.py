@@ -21,67 +21,29 @@ def holdout_physics_models(nominal: PhysicsConfig) -> list[HoldoutScenario]:
     return [
         HoldoutScenario(
             "mass/inertia +1.1% holdout",
-            replace(
-                nominal,
-                link_mass_1_kg=nominal.link_mass_1_kg * 1.011,
-                link_mass_2_kg=nominal.link_mass_2_kg * 1.011,
-                link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 1.011,
-                link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 1.011,
-            ),
+            replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 1.011, link_mass_2_kg=nominal.link_mass_2_kg * 1.011, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 1.011, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 1.011),
         ),
         HoldoutScenario(
             "mass/inertia -1.3% holdout",
-            replace(
-                nominal,
-                link_mass_1_kg=nominal.link_mass_1_kg * 0.987,
-                link_mass_2_kg=nominal.link_mass_2_kg * 0.987,
-                link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 0.987,
-                link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 0.987,
-            ),
+            replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 0.987, link_mass_2_kg=nominal.link_mass_2_kg * 0.987, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 0.987, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 0.987),
         ),
         HoldoutScenario(
             "length/COM +0.6% holdout",
-            replace(
-                nominal,
-                link_length_1_m=nominal.link_length_1_m * 1.006,
-                link_length_2_m=nominal.link_length_2_m * 1.006,
-                link_com_1_m=nominal.link_com_1_m * 1.006,
-                link_com_2_m=nominal.link_com_2_m * 1.006,
-            ),
+            replace(nominal, link_length_1_m=nominal.link_length_1_m * 1.006, link_length_2_m=nominal.link_length_2_m * 1.006, link_com_1_m=nominal.link_com_1_m * 1.006, link_com_2_m=nominal.link_com_2_m * 1.006),
         ),
         HoldoutScenario(
             "length/COM -0.4% holdout",
-            replace(
-                nominal,
-                link_length_1_m=nominal.link_length_1_m * 0.996,
-                link_length_2_m=nominal.link_length_2_m * 0.996,
-                link_com_1_m=nominal.link_com_1_m * 0.996,
-                link_com_2_m=nominal.link_com_2_m * 0.996,
-            ),
+            replace(nominal, link_length_1_m=nominal.link_length_1_m * 0.996, link_length_2_m=nominal.link_length_2_m * 0.996, link_com_1_m=nominal.link_com_1_m * 0.996, link_com_2_m=nominal.link_com_2_m * 0.996),
         ),
-        HoldoutScenario(
-            "motor tau +6% holdout",
-            replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 1.06),
-        ),
-        HoldoutScenario(
-            "motor tau -4% holdout",
-            replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 0.96),
-        ),
+        HoldoutScenario("motor tau +6% holdout", replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 1.06)),
+        HoldoutScenario("motor tau -4% holdout", replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 0.96)),
         HoldoutScenario(
             "joint damping +6% holdout",
-            replace(
-                nominal,
-                joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 1.06,
-                joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 1.06,
-            ),
+            replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 1.06, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 1.06),
         ),
         HoldoutScenario(
             "joint damping -7% holdout",
-            replace(
-                nominal,
-                joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 0.93,
-                joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 0.93,
-            ),
+            replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 0.93, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 0.93),
         ),
     ]
 
@@ -101,12 +63,15 @@ def _summarize(rows: list[dict]) -> dict[str, float | int]:
 def evaluate_holdout_robustness(
     nominal: PhysicsConfig,
     library: dict[str, AdaptiveLibraryEntry],
-    identification_s: float = 0.5,
+    identification_s: float = 1.0,
     noisy_seeds: tuple[int, ...] = (11, 22, 33),
     sensor_noise: SensorNoiseConfig | None = None,
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
-    """Evaluate interpolation and noisy-state generalization without adding bank entries."""
+    """Evaluate bank-interior interpolation and noisy-state generalization."""
     sensor_noise = sensor_noise or SensorNoiseConfig()
+    # Holdout identification needs enough accumulated dynamics to estimate a
+    # continuous parameter fraction; endpoint tests keep their historical 0.5 s gate.
+    identification_window_s = max(1.0, float(identification_s))
     rows: list[dict] = []
 
     for scenario in holdout_physics_models(nominal):
@@ -114,61 +79,47 @@ def evaluate_holdout_robustness(
         clean = simulate_adaptive_hybrid(
             actual_plant,
             library,
-            identification_s=identification_s,
+            identification_s=identification_window_s,
             total_s=40.0,
+            continuous_selection=True,
         )
-        clean_metrics = evaluate_history(
-            actual_plant,
-            clean.history.times_s,
-            clean.history.states,
-            clean.history.commands_nm,
-        )
-        rows.append(
-            {
-                "scenario": scenario.name,
-                "condition": "clean-holdout",
-                "sensor_seed": -1,
-                "selected_model": clean.selected_model,
-                "capture": bool(clean_metrics.capture),
-                "capture_time_s": float(clean_metrics.capture_time_s),
-                "final_stable": bool(clean_metrics.final_stable),
-                "stable_ratio": float(clean_metrics.stable_ratio),
-                "final_2s_stable_ratio": float(clean_metrics.final_2s_stable_ratio),
-            }
-        )
+        clean_metrics = evaluate_history(actual_plant, clean.history.times_s, clean.history.states, clean.history.commands_nm)
+        rows.append({
+            "scenario": scenario.name,
+            "condition": "clean-holdout",
+            "sensor_seed": -1,
+            "selected_model": clean.selected_model,
+            "capture": bool(clean_metrics.capture),
+            "capture_time_s": float(clean_metrics.capture_time_s),
+            "final_stable": bool(clean_metrics.final_stable),
+            "stable_ratio": float(clean_metrics.stable_ratio),
+            "final_2s_stable_ratio": float(clean_metrics.final_2s_stable_ratio),
+        })
 
         for seed in noisy_seeds:
             noisy = simulate_adaptive_hybrid(
                 actual_plant,
                 library,
-                identification_s=identification_s,
+                identification_s=identification_window_s,
                 total_s=40.0,
                 sensor_noise=sensor_noise,
                 sensor_seed=seed,
+                continuous_selection=True,
+                calibration_samples=50,
             )
-            noisy_metrics = evaluate_history(
-                actual_plant,
-                noisy.history.times_s,
-                noisy.history.states,
-                noisy.history.commands_nm,
-            )
-            rows.append(
-                {
-                    "scenario": scenario.name,
-                    "condition": "noisy-holdout",
-                    "sensor_seed": int(seed),
-                    "selected_model": noisy.selected_model,
-                    "capture": bool(noisy_metrics.capture),
-                    "capture_time_s": float(noisy_metrics.capture_time_s),
-                    "final_stable": bool(noisy_metrics.final_stable),
-                    "stable_ratio": float(noisy_metrics.stable_ratio),
-                    "final_2s_stable_ratio": float(noisy_metrics.final_2s_stable_ratio),
-                }
-            )
+            noisy_metrics = evaluate_history(actual_plant, noisy.history.times_s, noisy.history.states, noisy.history.commands_nm)
+            rows.append({
+                "scenario": scenario.name,
+                "condition": "noisy-holdout",
+                "sensor_seed": int(seed),
+                "selected_model": noisy.selected_model,
+                "capture": bool(noisy_metrics.capture),
+                "capture_time_s": float(noisy_metrics.capture_time_s),
+                "final_stable": bool(noisy_metrics.final_stable),
+                "stable_ratio": float(noisy_metrics.stable_ratio),
+                "final_2s_stable_ratio": float(noisy_metrics.final_2s_stable_ratio),
+            })
 
     clean_rows = [row for row in rows if row["condition"] == "clean-holdout"]
     noisy_rows = [row for row in rows if row["condition"] == "noisy-holdout"]
-    return rows, {
-        "clean-holdout": _summarize(clean_rows),
-        "noisy-holdout": _summarize(noisy_rows),
-    }
+    return rows, {"clean-holdout": _summarize(clean_rows), "noisy-holdout": _summarize(noisy_rows)}
