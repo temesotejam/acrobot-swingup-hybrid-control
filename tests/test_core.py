@@ -4,9 +4,15 @@ import math
 
 import numpy as np
 
-from acrobot_hybrid.controllers import lqr_command, upright_lqr_gain
+from acrobot_hybrid.controllers import (
+    lqr_command,
+    numerical_discrete_linearization,
+    trajectory_feedback_command,
+    upright_lqr_gain,
+)
 from acrobot_hybrid.optimization import generate_energy_seed
 from acrobot_hybrid.plant import AcrobotPlant, PhysicsConfig
+from acrobot_hybrid.robustness import default_robustness_scenarios
 
 
 def test_geometry_and_energy_gap_match_benchmark() -> None:
@@ -40,3 +46,30 @@ def test_local_lqr_stabilizes_small_upright_perturbation() -> None:
         state = plant.step(state, command)
     assert abs(state[0] - target[0]) < initial_error
     assert plant.tip_height_m(state) > 1.99
+
+
+def test_discrete_linearization_matches_step_dimensions() -> None:
+    plant = AcrobotPlant(PhysicsConfig(), wrap_angles=False)
+    state = np.array([0.2, -0.1, 0.3, -0.2, 0.05], dtype=np.float64)
+    a, b = numerical_discrete_linearization(plant, state, 0.2)
+    assert a.shape == (5, 5)
+    assert b.shape == (5, 1)
+    assert np.isfinite(a).all()
+    assert np.isfinite(b).all()
+    assert abs(b[4, 0]) > 0.1
+
+
+def test_trajectory_feedback_has_full_physical_torque_authority() -> None:
+    state = np.array([0.1, 0.0, 0.0, 0.0, 0.0])
+    nominal = np.zeros(5)
+    gain = np.array([[100.0, 0.0, 0.0, 0.0, 0.0]])
+    command = trajectory_feedback_command(state, nominal, 0.98, gain, 1.0)
+    assert command == -1.0
+
+
+def test_robustness_scenario_groups_are_explicit() -> None:
+    scenarios = default_robustness_scenarios(PhysicsConfig())
+    groups = [item.group for item in scenarios]
+    assert groups.count("initial-state") == 8
+    assert groups.count("model-mismatch") == 8
+    assert groups.count("stress") == 4

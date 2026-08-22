@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from scipy.linalg import solve_continuous_are
+from scipy.linalg import solve_continuous_are, solve_discrete_are
 
 from .plant import AcrobotPlant
 
@@ -30,6 +30,30 @@ def numerical_linearization(
     return a, b
 
 
+def numerical_discrete_linearization(
+    plant: AcrobotPlant,
+    state: np.ndarray,
+    command_nm: float,
+    state_epsilon: float = 1e-5,
+    command_epsilon: float = 1e-5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Linearize the exact RK4 one-step map used by the simulator."""
+    x0 = np.asarray(state, dtype=np.float64)
+    n = x0.size
+    a = np.zeros((n, n), dtype=np.float64)
+    for index in range(n):
+        delta = np.zeros(n, dtype=np.float64)
+        delta[index] = state_epsilon
+        a[:, index] = (
+            plant.step(x0 + delta, command_nm) - plant.step(x0 - delta, command_nm)
+        ) / (2.0 * state_epsilon)
+    b = (
+        (plant.step(x0, command_nm + command_epsilon) - plant.step(x0, command_nm - command_epsilon))
+        / (2.0 * command_epsilon)
+    ).reshape(n, 1)
+    return a, b
+
+
 def upright_lqr_gain(plant: AcrobotPlant) -> np.ndarray:
     equilibrium = np.array([math.pi, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
     a, b = numerical_linearization(plant, equilibrium)
@@ -39,10 +63,63 @@ def upright_lqr_gain(plant: AcrobotPlant) -> np.ndarray:
     return np.linalg.solve(r, b.T @ p)
 
 
+def tvlqr_gains(
+    plant: AcrobotPlant,
+    nominal_states: np.ndarray,
+    nominal_commands_nm: np.ndarray,
+    q_diagonal: tuple[float, float, float, float, float] = (2.0, 1.0, 0.5, 0.2, 0.05),
+    r_weight: float = 5.0,
+) -> np.ndarray:
+    """Finite-horizon discrete TVLQR around the optimized swing-up trajectory.
+
+    The trajectory uses a slightly smaller torque bound than the physical plant,
+    leaving actuator headroom for this feedback correction.
+    """
+    states = np.asarray(nominal_states, dtype=np.float64)
+    commands = np.asarray(nominal_commands_nm, dtype=np.float64).reshape(-1)
+    if states.shape != (5, commands.size + 1):
+        raise ValueError("nominal_states must have shape (5, len(commands)+1)")
+
+    q = np.diag(np.asarray(q_diagonal, dtype=np.float64))
+    r = np.array([[float(r_weight)]], dtype=np.float64)
+    linearizations = [
+        numerical_discrete_linearization(plant, states[:, index], float(commands[index]))
+        for index in range(commands.size)
+    ]
+
+    terminal_a, terminal_b = numerical_discrete_linearization(plant, states[:, -1], 0.0)
+    try:
+        p = solve_discrete_are(terminal_a, terminal_b, q, r)
+    except Exception:
+        p = np.diag([500.0, 300.0, 50.0, 30.0, 5.0])
+
+    gains = np.zeros((commands.size, 1, 5), dtype=np.float64)
+    for index in range(commands.size - 1, -1, -1):
+        a, b = linearizations[index]
+        s = r + b.T @ p @ b
+        gain = np.linalg.solve(s, b.T @ p @ a)
+        gains[index] = gain
+        p = q + a.T @ p @ (a - b @ gain)
+        p = 0.5 * (p + p.T)
+    return gains
+
+
 def lqr_command(state: np.ndarray, target: np.ndarray, gain: np.ndarray, max_torque_nm: float) -> float:
     error = np.asarray(state, dtype=np.float64) - np.asarray(target, dtype=np.float64)
     command = float(-(gain @ error)[0])
     return float(np.clip(command, -max_torque_nm, max_torque_nm))
+
+
+def trajectory_feedback_command(
+    state: np.ndarray,
+    nominal_state: np.ndarray,
+    nominal_command_nm: float,
+    gain: np.ndarray,
+    max_torque_nm: float,
+) -> float:
+    error = np.asarray(state, dtype=np.float64) - np.asarray(nominal_state, dtype=np.float64)
+    correction = float((gain @ error)[0])
+    return float(np.clip(float(nominal_command_nm) - correction, -max_torque_nm, max_torque_nm))
 
 
 def energy_seed_command(
