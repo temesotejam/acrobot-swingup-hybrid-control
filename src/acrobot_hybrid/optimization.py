@@ -17,9 +17,10 @@ class OptimizationResult:
     target_state: np.ndarray
     objective: float
     solver_status: str
+    nominal_torque_limit_nm: float
 
 
-def generate_energy_seed(plant: AcrobotPlant, horizon_s: float = 20.0) -> tuple[np.ndarray, np.ndarray]:
+def generate_energy_seed(plant: AcrobotPlant, horizon_s: float = 21.0) -> tuple[np.ndarray, np.ndarray]:
     steps = int(round(horizon_s / plant.config.dt_s))
     state = np.zeros(5, dtype=np.float64)
     states = [state.copy()]
@@ -71,18 +72,21 @@ def _rk4(x, u, p: PhysicsConfig):
 
 def optimize_nominal_trajectory(
     plant: AcrobotPlant,
-    horizon_s: float = 20.0,
+    horizon_s: float = 21.0,
+    nominal_torque_limit_nm: float = 0.98,
 ) -> OptimizationResult:
-    """Direct multiple-shooting optimization seeded by deterministic energy shaping.
+    """Optimize a swing-up trajectory while reserving actuator feedback headroom.
 
-    The energy-shaping seed gets the underactuated mechanism close to the
-    upright energy manifold. IPOPT then adjusts the bounded torque history so
-    the terminal state is close enough to the upright equilibrium for the local
-    LQR controller to take over.
+    The physical actuator remains limited to +/-1 N m.  The nominal trajectory
+    deliberately uses a slightly smaller bound so TVLQR can correct state
+    errors instead of immediately saturating at the open-loop command limit.
     """
     seed_states, seed_commands = generate_energy_seed(plant, horizon_s=horizon_s)
     p = plant.config
     steps = seed_commands.size
+    torque_limit = float(nominal_torque_limit_nm)
+    if not 0.0 < torque_limit <= p.max_torque_nm:
+        raise ValueError("nominal_torque_limit_nm must be within the physical torque bound")
 
     theta1_turn = round((seed_states[-1, 0] - math.pi) / (2.0 * math.pi))
     theta2_turn = round(seed_states[-1, 1] / (2.0 * math.pi))
@@ -97,31 +101,35 @@ def optimize_nominal_trajectory(
     opti.subject_to(x[:, 0] == ca.DM.zeros(5, 1))
     for index in range(steps):
         opti.subject_to(x[:, index + 1] == _rk4(x[:, index], u[:, index], p))
-    opti.subject_to(opti.bounded(-p.max_torque_nm, u, p.max_torque_nm))
+    opti.subject_to(opti.bounded(-torque_limit, u, torque_limit))
 
     error = x[:, -1] - ca.DM(target)
     objective = (
-        2000.0 * error[0] ** 2
-        + 1000.0 * error[1] ** 2
-        + 300.0 * error[2] ** 2
-        + 150.0 * error[3] ** 2
-        + 20.0 * error[4] ** 2
+        10000.0 * error[0] ** 2
+        + 5000.0 * error[1] ** 2
+        + 1500.0 * error[2] ** 2
+        + 800.0 * error[3] ** 2
+        + 100.0 * error[4] ** 2
     )
-    settle_start = int(0.90 * steps)
+    settle_start = int(0.85 * steps)
     for index in range(steps):
-        objective += 0.002 * u[0, index] ** 2
+        objective += 0.001 * u[0, index] ** 2
         if index >= settle_start:
-            e1 = x[0, index] - target[0]
-            e2 = x[1, index] - target[1]
-            objective += 0.10 * e1**2 + 0.05 * e2**2 + 0.02 * x[2, index] ** 2 + 0.01 * x[3, index] ** 2
+            settle_error = x[:, index] - ca.DM(target)
+            objective += (
+                0.20 * settle_error[0] ** 2
+                + 0.10 * settle_error[1] ** 2
+                + 0.05 * settle_error[2] ** 2
+                + 0.03 * settle_error[3] ** 2
+            )
     opti.minimize(objective)
 
     opti.set_initial(x, seed_states.T)
-    opti.set_initial(u, seed_commands.reshape(1, -1))
+    opti.set_initial(u, np.clip(seed_commands, -torque_limit, torque_limit).reshape(1, -1))
     opti.solver(
         "ipopt",
         {"expand": True, "print_time": False},
-        {"max_iter": 1200, "print_level": 0, "sb": "yes", "tol": 1e-6, "acceptable_tol": 1e-4},
+        {"max_iter": 1600, "print_level": 0, "sb": "yes", "tol": 1e-6, "acceptable_tol": 1e-4},
     )
     solution = opti.solve()
     return OptimizationResult(
@@ -130,4 +138,5 @@ def optimize_nominal_trajectory(
         target_state=target,
         objective=float(solution.value(objective)),
         solver_status=str(opti.stats().get("return_status", "unknown")),
+        nominal_torque_limit_nm=torque_limit,
     )
