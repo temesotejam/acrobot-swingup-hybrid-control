@@ -71,13 +71,14 @@ def evaluate_holdout_robustness(
     noisy_seeds: tuple[int, ...] = (11, 22, 33),
     sensor_noise: SensorNoiseConfig | None = None,
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
-    """Evaluate bank-interior parameters and diagnose noisy upright hold.
+    """Evaluate bank-interior parameters under clean and noisy sensing.
 
-    The primary noisy trials use a conservative state-and-dwell handoff to the
-    EKF-backed upright LQR.  One representative holdout family is additionally
-    replayed with a fixed end-of-trajectory handoff and three hold-state
-    sources.  That separates a bad handoff from estimator error and from a
-    regulator that cannot stabilize the actual plant even with perfect state.
+    Primary noisy trials use late re-identification, a recovery nonlinear
+    replan when needed, and an empirically verified LQR-basin handoff.  Run
+    #23 already showed that true-state, raw-measurement and EKF fixed handoffs
+    all fail in the representative motor-tau holdout.  We therefore retain
+    only the perfect-state fixed-handoff control as the diagnostic baseline so
+    CI time is spent on the 24 primary noisy recovery trials.
     """
     sensor_noise = sensor_noise or SensorNoiseConfig()
     rows: list[dict] = []
@@ -117,28 +118,27 @@ def evaluate_holdout_robustness(
                 supervised_row["condition"] = "diagnostic-ekf-supervised"
                 rows.append(supervised_row)
 
-                for hold_source in ("true", "measurement", "ekf"):
-                    diagnostic = simulate_terminal_replan_hybrid(
+                diagnostic = simulate_terminal_replan_hybrid(
+                    actual_plant,
+                    library,
+                    identification_s=max(1.0, float(identification_s)),
+                    replan_start_s=18.0,
+                    total_s=40.0,
+                    sensor_noise=sensor_noise,
+                    sensor_seed=seed,
+                    calibration_samples=50,
+                    hold_state_source="true",
+                    capture_supervisor=False,
+                )
+                rows.append(
+                    _result_row(
+                        scenario,
+                        "diagnostic-true-fixed-handoff",
+                        seed,
                         actual_plant,
-                        library,
-                        identification_s=max(1.0, float(identification_s)),
-                        replan_start_s=18.0,
-                        total_s=40.0,
-                        sensor_noise=sensor_noise,
-                        sensor_seed=seed,
-                        calibration_samples=50,
-                        hold_state_source=hold_source,
-                        capture_supervisor=False,
+                        diagnostic,
                     )
-                    rows.append(
-                        _result_row(
-                            scenario,
-                            f"diagnostic-{hold_source}-fixed-handoff",
-                            seed,
-                            actual_plant,
-                            diagnostic,
-                        )
-                    )
+                )
 
     conditions = sorted({str(row["condition"]) for row in rows})
     summary = {
