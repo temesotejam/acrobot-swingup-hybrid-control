@@ -5,6 +5,7 @@ import math
 
 import numpy as np
 
+from .adaptive import AdaptiveLibraryEntry, simulate_adaptive_hybrid
 from .controllers import tvlqr_gains
 from .evaluation import evaluate_history
 from .optimization import OptimizationResult
@@ -110,13 +111,19 @@ def evaluate_robustness(
     optimization: OptimizationResult,
     hold_s: float = 19.0,
     gains: np.ndarray | None = None,
+    adaptive_library: dict[str, AdaptiveLibraryEntry] | None = None,
 ) -> tuple[list[dict], dict]:
     if gains is None:
         gains = tvlqr_gains(nominal_plant, optimization.states, optimization.commands_nm)
     rows: list[dict] = []
+    controllers = ["open-loop", "tvlqr"]
+    if adaptive_library is not None:
+        controllers.append("adaptive")
+
     for scenario in default_robustness_scenarios(nominal_plant.config):
         actual_plant = AcrobotPlant(scenario.physics, wrap_angles=False)
-        for controller in ("open-loop", "tvlqr"):
+        for controller in controllers:
+            selected_model = ""
             if controller == "open-loop":
                 history = simulate_optimized_hybrid(
                     actual_plant,
@@ -125,7 +132,7 @@ def evaluate_robustness(
                     initial_state=scenario.initial_state,
                     controller_plant=nominal_plant,
                 )
-            else:
+            elif controller == "tvlqr":
                 history = simulate_tvlqr_hybrid(
                     nominal_plant,
                     actual_plant,
@@ -134,12 +141,24 @@ def evaluate_robustness(
                     hold_s=hold_s,
                     initial_state=scenario.initial_state,
                 )
+            else:
+                adaptive = simulate_adaptive_hybrid(
+                    actual_plant,
+                    adaptive_library or {},
+                    initial_state=scenario.initial_state,
+                    identification_s=0.5,
+                    total_s=40.0,
+                )
+                history = adaptive.history
+                selected_model = adaptive.selected_model
+
             metrics = evaluate_history(actual_plant, history.times_s, history.states, history.commands_nm)
             rows.append(
                 {
                     "scenario": scenario.name,
                     "group": scenario.group,
                     "controller": controller,
+                    "selected_model": selected_model,
                     "capture": bool(metrics.capture),
                     "capture_time_s": float(metrics.capture_time_s),
                     "final_stable": bool(metrics.final_stable),
@@ -153,7 +172,7 @@ def evaluate_robustness(
     summary: dict[str, dict[str, dict[str, float | int]]] = {}
     for group in sorted({row["group"] for row in rows}):
         summary[group] = {}
-        for controller in ("open-loop", "tvlqr"):
+        for controller in controllers:
             selected = [row for row in rows if row["group"] == group and row["controller"] == controller]
             summary[group][controller] = {
                 "count": len(selected),
