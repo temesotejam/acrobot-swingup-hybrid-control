@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 
 import numpy as np
 
@@ -28,62 +29,70 @@ class AdaptiveSimulationResult:
     identification_steps: int
 
 
+@dataclass(frozen=True)
+class ContinuousModelEstimate:
+    family: str
+    alpha: float
+    error: float
+    physics: PhysicsConfig
+
+
+FAMILY_ENDPOINTS = {
+    "mass/inertia": ("mass/inertia -2%", "mass/inertia +2%"),
+    "length/COM": ("length/COM -1%", "length/COM +1%"),
+    "motor tau": ("motor tau -10%", "motor tau +10%"),
+    "joint damping": ("joint damping -10%", "joint damping +10%"),
+}
+
+
+def interpolate_physics(nominal: PhysicsConfig, family: str, alpha: float) -> PhysicsConfig:
+    alpha = float(np.clip(alpha, -1.0, 1.0))
+    if family == "mass/inertia":
+        scale = 1.0 + 0.02 * alpha
+        return replace(
+            nominal,
+            link_mass_1_kg=nominal.link_mass_1_kg * scale,
+            link_mass_2_kg=nominal.link_mass_2_kg * scale,
+            link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * scale,
+            link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * scale,
+        )
+    if family == "length/COM":
+        scale = 1.0 + 0.01 * alpha
+        return replace(
+            nominal,
+            link_length_1_m=nominal.link_length_1_m * scale,
+            link_length_2_m=nominal.link_length_2_m * scale,
+            link_com_1_m=nominal.link_com_1_m * scale,
+            link_com_2_m=nominal.link_com_2_m * scale,
+        )
+    if family == "motor tau":
+        return replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * (1.0 + 0.10 * alpha))
+    if family == "joint damping":
+        scale = 1.0 + 0.10 * alpha
+        return replace(
+            nominal,
+            joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * scale,
+            joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * scale,
+        )
+    raise ValueError(f"unknown uncertainty family: {family}")
+
+
 def candidate_physics_models(nominal: PhysicsConfig) -> dict[str, PhysicsConfig]:
-    """Uncertainty bank used by the online multiple-model estimator."""
     return {
         "nominal": nominal,
-        "mass/inertia +2%": replace(
-            nominal,
-            link_mass_1_kg=nominal.link_mass_1_kg * 1.02,
-            link_mass_2_kg=nominal.link_mass_2_kg * 1.02,
-            link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 1.02,
-            link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 1.02,
-        ),
-        "mass/inertia -2%": replace(
-            nominal,
-            link_mass_1_kg=nominal.link_mass_1_kg * 0.98,
-            link_mass_2_kg=nominal.link_mass_2_kg * 0.98,
-            link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 0.98,
-            link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 0.98,
-        ),
-        "length/COM +1%": replace(
-            nominal,
-            link_length_1_m=nominal.link_length_1_m * 1.01,
-            link_length_2_m=nominal.link_length_2_m * 1.01,
-            link_com_1_m=nominal.link_com_1_m * 1.01,
-            link_com_2_m=nominal.link_com_2_m * 1.01,
-        ),
-        "length/COM -1%": replace(
-            nominal,
-            link_length_1_m=nominal.link_length_1_m * 0.99,
-            link_length_2_m=nominal.link_length_2_m * 0.99,
-            link_com_1_m=nominal.link_com_1_m * 0.99,
-            link_com_2_m=nominal.link_com_2_m * 0.99,
-        ),
-        "motor tau +10%": replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 1.10),
-        "motor tau -10%": replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 0.90),
-        "joint damping +10%": replace(
-            nominal,
-            joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 1.10,
-            joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 1.10,
-        ),
-        "joint damping -10%": replace(
-            nominal,
-            joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 0.90,
-            joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 0.90,
-        ),
+        "mass/inertia +2%": interpolate_physics(nominal, "mass/inertia", +1.0),
+        "mass/inertia -2%": interpolate_physics(nominal, "mass/inertia", -1.0),
+        "length/COM +1%": interpolate_physics(nominal, "length/COM", +1.0),
+        "length/COM -1%": interpolate_physics(nominal, "length/COM", -1.0),
+        "motor tau +10%": interpolate_physics(nominal, "motor tau", +1.0),
+        "motor tau -10%": interpolate_physics(nominal, "motor tau", -1.0),
+        "joint damping +10%": interpolate_physics(nominal, "joint damping", +1.0),
+        "joint damping -10%": interpolate_physics(nominal, "joint damping", -1.0),
     }
 
 
 class ModelBankEstimator:
-    """Select a model by rolling each hypothesis over the observed command window.
-
-    A one-step residual is easily dominated by sensor white noise because every
-    prediction is restarted from a new noisy observation. Here each candidate
-    starts from the first observed state and is propagated through the complete
-    identification command sequence, making persistent dynamics differences
-    accumulate while zero-mean measurement noise is averaged over the window.
-    """
+    """Estimate dynamics from a multi-step observed command/state window."""
 
     def __init__(self, models: dict[str, PhysicsConfig]):
         self.plants = {name: AcrobotPlant(config, wrap_angles=False) for name, config in models.items()}
@@ -103,19 +112,24 @@ class ModelBankEstimator:
         self.observations.append(after.copy())
         self.samples += 1
 
-    def _rollout_errors(self) -> dict[str, float]:
+    def _rollout_error(self, plant: AcrobotPlant) -> float:
         if self.initial_state is None or not self.commands:
-            return {name: 0.0 for name in self.plants}
-        errors: dict[str, float] = {}
-        for name, plant in self.plants.items():
-            predicted = self.initial_state.copy()
-            total = 0.0
-            for command, observed in zip(self.commands, self.observations[1:], strict=True):
-                predicted = plant.step(predicted, command)
-                residual = observed - predicted
-                total += float(np.sum(self.weights * np.square(residual)))
-            errors[name] = total
-        return errors
+            return 0.0
+        predicted = self.initial_state.copy()
+        total = 0.0
+        initial_observation = self.observations[0]
+        for command, observed in zip(self.commands, self.observations[1:], strict=True):
+            predicted = plant.step(predicted, command)
+            # Compare displacement from the initial observation. This cancels
+            # most static sensor bias while preserving dynamic mismatch signal.
+            predicted_delta = predicted - self.initial_state
+            observed_delta = observed - initial_observation
+            residual = observed_delta - predicted_delta
+            total += float(np.sum(self.weights * np.square(residual)))
+        return total
+
+    def _rollout_errors(self) -> dict[str, float]:
+        return {name: self._rollout_error(plant) for name, plant in self.plants.items()}
 
     def selected_model(self) -> str:
         errors = self._rollout_errors()
@@ -124,6 +138,23 @@ class ModelBankEstimator:
     def normalized_errors(self) -> dict[str, float]:
         denominator = max(1, self.samples)
         return {name: float(value / denominator) for name, value in self._rollout_errors().items()}
+
+    def continuous_estimate(
+        self,
+        nominal: PhysicsConfig,
+        grid_points: int = 41,
+    ) -> ContinuousModelEstimate:
+        best: ContinuousModelEstimate | None = None
+        for family in FAMILY_ENDPOINTS:
+            for alpha in np.linspace(-1.0, 1.0, int(grid_points)):
+                physics = interpolate_physics(nominal, family, float(alpha))
+                error = self._rollout_error(AcrobotPlant(physics, wrap_angles=False))
+                candidate = ContinuousModelEstimate(family, float(alpha), float(error), physics)
+                if best is None or candidate.error < best.error:
+                    best = candidate
+        if best is None:
+            raise RuntimeError("continuous estimator has no candidates")
+        return best
 
 
 def build_adaptive_library(
@@ -153,6 +184,34 @@ def build_adaptive_library(
     return library
 
 
+def _interpolated_library_entry(
+    library: dict[str, AdaptiveLibraryEntry],
+    estimate: ContinuousModelEstimate,
+) -> AdaptiveLibraryEntry:
+    nominal = library["nominal"]
+    negative_name, positive_name = FAMILY_ENDPOINTS[estimate.family]
+    endpoint = library[positive_name if estimate.alpha >= 0.0 else negative_name]
+    weight = abs(float(estimate.alpha))
+    states = (1.0 - weight) * nominal.optimization.states + weight * endpoint.optimization.states
+    commands = (1.0 - weight) * nominal.optimization.commands_nm + weight * endpoint.optimization.commands_nm
+    optimization = OptimizationResult(
+        states=states,
+        commands_nm=commands,
+        target_state=nominal.optimization.target_state.copy(),
+        objective=float("nan"),
+        solver_status="interpolated",
+        nominal_torque_limit_nm=(1.0 - weight) * nominal.optimization.nominal_torque_limit_nm + weight * endpoint.optimization.nominal_torque_limit_nm,
+    )
+    plant = AcrobotPlant(estimate.physics, wrap_angles=False)
+    return AdaptiveLibraryEntry(
+        name=f"{estimate.family} alpha={estimate.alpha:+.3f}",
+        plant=plant,
+        optimization=optimization,
+        tvlqr=(1.0 - weight) * nominal.tvlqr + weight * endpoint.tvlqr,
+        upright_lqr=(1.0 - weight) * nominal.upright_lqr + weight * endpoint.upright_lqr,
+    )
+
+
 def simulate_adaptive_hybrid(
     simulation_plant: AcrobotPlant,
     library: dict[str, AdaptiveLibraryEntry],
@@ -161,13 +220,10 @@ def simulate_adaptive_hybrid(
     total_s: float = 40.0,
     sensor_noise: SensorNoiseConfig | None = None,
     sensor_seed: int = 0,
+    continuous_selection: bool = False,
+    calibration_samples: int = 50,
 ) -> AdaptiveSimulationResult:
-    """Identify the plant online, track its nonlinear replan, then balance.
-
-    With sensor noise enabled, raw observations are used by the multi-step
-    model estimator while feedback control uses a lightweight model-predictive
-    observer. True state remains hidden inside the simulator except for metrics.
-    """
+    """Identify dynamics, track a selected/interpolated replan, then balance."""
     if "nominal" not in library:
         raise ValueError("adaptive library must contain a nominal entry")
     dt = simulation_plant.config.dt_s
@@ -178,15 +234,20 @@ def simulate_adaptive_hybrid(
     nominal = library["nominal"]
     models = {name: entry.plant.config for name, entry in library.items()}
     estimator = ModelBankEstimator(models)
-    identify_steps = min(
-        int(round(identification_s / dt)),
-        nominal.optimization.commands_nm.size - 1,
-    )
+    identify_steps = min(int(round(identification_s / dt)), nominal.optimization.commands_nm.size - 1)
     state = np.zeros(5, dtype=np.float64) if initial_state is None else np.asarray(initial_state, dtype=np.float64).copy()
     sensor = None if sensor_noise is None else NoisyStateSensor(sensor_noise, sensor_seed)
 
+    bias_estimate = np.zeros(5, dtype=np.float64)
+    if sensor is not None and calibration_samples > 0:
+        # The experiment begins at a known, stationary downward state. Average
+        # a short pre-run calibration window to estimate episode-static bias.
+        samples = np.asarray([sensor.observe(state) for _ in range(int(calibration_samples))])
+        bias_estimate = np.mean(samples, axis=0) - state
+
     def observe(value: np.ndarray) -> np.ndarray:
-        return np.asarray(value, dtype=np.float64).copy() if sensor is None else sensor.observe(value)
+        raw = np.asarray(value, dtype=np.float64).copy() if sensor is None else sensor.observe(value)
+        return raw - bias_estimate
 
     measurement = observe(state)
     observer = None if sensor is None else ModelPredictiveObserver(nominal.plant, measurement)
@@ -214,8 +275,14 @@ def simulate_adaptive_hybrid(
         commands.append(command)
         modes.append("identify")
 
-    selected_name = estimator.selected_model()
-    selected = library[selected_name]
+    if continuous_selection:
+        estimate = estimator.continuous_estimate(nominal.plant.config)
+        selected = _interpolated_library_entry(library, estimate)
+        selected_name = selected.name
+    else:
+        selected_name = estimator.selected_model()
+        selected = library[selected_name]
+
     if selected.optimization.commands_nm.size != nominal.optimization.commands_nm.size:
         raise ValueError("adaptive library trajectories must share one horizon")
     if observer is not None:
