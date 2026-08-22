@@ -19,32 +19,14 @@ class HoldoutScenario:
 def holdout_physics_models(nominal: PhysicsConfig) -> list[HoldoutScenario]:
     """Parameter values deliberately absent from the 9-model controller bank."""
     return [
-        HoldoutScenario(
-            "mass/inertia +1.1% holdout",
-            replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 1.011, link_mass_2_kg=nominal.link_mass_2_kg * 1.011, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 1.011, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 1.011),
-        ),
-        HoldoutScenario(
-            "mass/inertia -1.3% holdout",
-            replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 0.987, link_mass_2_kg=nominal.link_mass_2_kg * 0.987, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 0.987, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 0.987),
-        ),
-        HoldoutScenario(
-            "length/COM +0.6% holdout",
-            replace(nominal, link_length_1_m=nominal.link_length_1_m * 1.006, link_length_2_m=nominal.link_length_2_m * 1.006, link_com_1_m=nominal.link_com_1_m * 1.006, link_com_2_m=nominal.link_com_2_m * 1.006),
-        ),
-        HoldoutScenario(
-            "length/COM -0.4% holdout",
-            replace(nominal, link_length_1_m=nominal.link_length_1_m * 0.996, link_length_2_m=nominal.link_length_2_m * 0.996, link_com_1_m=nominal.link_com_1_m * 0.996, link_com_2_m=nominal.link_com_2_m * 0.996),
-        ),
+        HoldoutScenario("mass/inertia +1.1% holdout", replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 1.011, link_mass_2_kg=nominal.link_mass_2_kg * 1.011, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 1.011, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 1.011)),
+        HoldoutScenario("mass/inertia -1.3% holdout", replace(nominal, link_mass_1_kg=nominal.link_mass_1_kg * 0.987, link_mass_2_kg=nominal.link_mass_2_kg * 0.987, link_moi_1_kg_m2=nominal.link_moi_1_kg_m2 * 0.987, link_moi_2_kg_m2=nominal.link_moi_2_kg_m2 * 0.987)),
+        HoldoutScenario("length/COM +0.6% holdout", replace(nominal, link_length_1_m=nominal.link_length_1_m * 1.006, link_length_2_m=nominal.link_length_2_m * 1.006, link_com_1_m=nominal.link_com_1_m * 1.006, link_com_2_m=nominal.link_com_2_m * 1.006)),
+        HoldoutScenario("length/COM -0.4% holdout", replace(nominal, link_length_1_m=nominal.link_length_1_m * 0.996, link_length_2_m=nominal.link_length_2_m * 0.996, link_com_1_m=nominal.link_com_1_m * 0.996, link_com_2_m=nominal.link_com_2_m * 0.996)),
         HoldoutScenario("motor tau +6% holdout", replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 1.06)),
         HoldoutScenario("motor tau -4% holdout", replace(nominal, motor_time_constant_s=nominal.motor_time_constant_s * 0.96)),
-        HoldoutScenario(
-            "joint damping +6% holdout",
-            replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 1.06, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 1.06),
-        ),
-        HoldoutScenario(
-            "joint damping -7% holdout",
-            replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 0.93, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 0.93),
-        ),
+        HoldoutScenario("joint damping +6% holdout", replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 1.06, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 1.06)),
+        HoldoutScenario("joint damping -7% holdout", replace(nominal, joint1_damping_nm_per_rad_s=nominal.joint1_damping_nm_per_rad_s * 0.93, joint2_damping_nm_per_rad_s=nominal.joint2_damping_nm_per_rad_s * 0.93)),
     ]
 
 
@@ -69,8 +51,6 @@ def evaluate_holdout_robustness(
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
     """Evaluate bank-interior interpolation and noisy-state generalization."""
     sensor_noise = sensor_noise or SensorNoiseConfig()
-    # Holdout identification needs enough accumulated dynamics to estimate a
-    # continuous parameter fraction; endpoint tests keep their historical 0.5 s gate.
     identification_window_s = max(1.0, float(identification_s))
     rows: list[dict] = []
 
@@ -82,6 +62,7 @@ def evaluate_holdout_robustness(
             identification_s=identification_window_s,
             total_s=40.0,
             continuous_selection=True,
+            capture_supervisor=True,
         )
         clean_metrics = evaluate_history(actual_plant, clean.history.times_s, clean.history.states, clean.history.commands_nm)
         rows.append({
@@ -106,6 +87,7 @@ def evaluate_holdout_robustness(
                 sensor_seed=seed,
                 continuous_selection=True,
                 calibration_samples=50,
+                capture_supervisor=True,
             )
             noisy_metrics = evaluate_history(actual_plant, noisy.history.times_s, noisy.history.states, noisy.history.commands_nm)
             rows.append({
