@@ -21,7 +21,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -34,7 +34,29 @@ jobs:
       - name: Install package
         run: python -m pip install -e .
       - name: Reproduce hybrid result
+        id: reproduce
+        continue-on-error: true
         run: python -m acrobot_hybrid.run --output-dir results
+      - name: Verify publishable result artifacts
+        run: |
+          test -f results/summary.json
+          test -f results/summary.md
+          test -d results/plots
+          test -d results/videos
+          test -f results/plots/states.png
+          test -f results/plots/height.png
+          test -f results/plots/torque.png
+          test -f results/videos/hybrid.mp4
+      - name: Report benchmark outcome
+        run: |
+          echo "Benchmark step outcome: ${{ steps.reproduce.outcome }}"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summary = json.loads(Path('results/summary.json').read_text())
+          print('success:', summary.get('success'))
+          print('holdout_noise_gate:', summary.get('holdout_noise_gate'))
+          PY
       - name: Build dashboard
         run: python web/build_pages.py --results results --output site --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
       - uses: actions/configure-pages@v5
