@@ -10,12 +10,7 @@ from .plant import AcrobotPlant
 
 @dataclass(frozen=True)
 class SensorNoiseConfig:
-    """State-measurement noise used by robustness tests.
-
-    Defaults intentionally match the noise scale used in the companion RL
-    benchmark for joint angles and gyros. Biases are sampled once per episode;
-    white noise is sampled at every observation.
-    """
+    """State-measurement noise used by robustness tests."""
 
     angle_white_std_deg: float = 0.25
     angle_bias_std_deg: float = 1.0
@@ -56,13 +51,7 @@ class NoisyStateSensor:
 
 
 class ModelPredictiveObserver:
-    """Lightweight predict/correct filter for noisy five-state feedback.
-
-    The model prediction carries fast swing-up motion without introducing the
-    phase lag of a plain low-pass filter. Measurement correction suppresses
-    white noise while still allowing fixed sensor bias and model mismatch to be
-    visible to the controller/estimator robustness test.
-    """
+    """Small fixed-gain predict/correct filter retained for swing-up tracking."""
 
     def __init__(
         self,
@@ -81,4 +70,57 @@ class ModelPredictiveObserver:
         predicted = self.plant.step(self.estimate, float(command_nm))
         residual = np.asarray(measurement, dtype=np.float64) - predicted
         self.estimate = predicted + self.correction * residual
+        return self.estimate.copy()
+
+
+def _step_jacobian(plant: AcrobotPlant, state: np.ndarray, command_nm: float, epsilon: float = 1e-5) -> np.ndarray:
+    state = np.asarray(state, dtype=np.float64)
+    jacobian = np.zeros((5, 5), dtype=np.float64)
+    for index in range(5):
+        delta = np.zeros(5, dtype=np.float64)
+        delta[index] = epsilon
+        jacobian[:, index] = (
+            plant.step(state + delta, command_nm) - plant.step(state - delta, command_nm)
+        ) / (2.0 * epsilon)
+    return jacobian
+
+
+class ExtendedKalmanObserver:
+    """Nonlinear process-model EKF for the full measured Acrobot state."""
+
+    def __init__(
+        self,
+        plant: AcrobotPlant,
+        initial_state: np.ndarray,
+        sensor_config: SensorNoiseConfig,
+    ):
+        self.plant = plant
+        self.estimate = np.asarray(initial_state, dtype=np.float64).copy()
+        angle_sigma = math.radians(sensor_config.angle_white_std_deg)
+        gyro_sigma = math.radians(sensor_config.gyro_white_std_dps)
+        torque_sigma = sensor_config.torque_white_std_nm
+        self.r = np.diag(
+            np.square([angle_sigma * 1.2, angle_sigma * 1.2, gyro_sigma * 1.3, gyro_sigma * 1.3, torque_sigma * 1.2])
+        )
+        self.q = np.diag([2e-8, 2e-8, 3e-6, 3e-6, 2e-5])
+        self.covariance = self.r.copy()
+        self.identity = np.eye(5, dtype=np.float64)
+
+    def set_plant(self, plant: AcrobotPlant) -> None:
+        self.plant = plant
+
+    def reset(self, estimate: np.ndarray, covariance_scale: float = 1.0) -> None:
+        self.estimate = np.asarray(estimate, dtype=np.float64).copy()
+        self.covariance = self.r * float(covariance_scale)
+
+    def update(self, command_nm: float, measurement: np.ndarray) -> np.ndarray:
+        a = _step_jacobian(self.plant, self.estimate, float(command_nm))
+        predicted = self.plant.step(self.estimate, float(command_nm))
+        p_pred = a @ self.covariance @ a.T + self.q
+        innovation_cov = p_pred + self.r
+        kalman_gain = np.linalg.solve(innovation_cov.T, p_pred.T).T
+        innovation = np.asarray(measurement, dtype=np.float64) - predicted
+        self.estimate = predicted + kalman_gain @ innovation
+        self.covariance = (self.identity - kalman_gain) @ p_pred
+        self.covariance = 0.5 * (self.covariance + self.covariance.T)
         return self.estimate.copy()
