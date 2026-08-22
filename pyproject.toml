@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acrobot-swingup-hybrid-control"
+version = "0.1.0"
+description = "Model-based and hybrid swing-up control for a continuous-torque Acrobot"
+requires-python = ">=3.11"
+dependencies = [
+  "casadi==3.7.2",
+  "numpy>=2.0,<3",
+  "scipy>=1.14,<2",
+  "matplotlib>=3.9,<4",
+  "Pillow>=10,<12",
+  "imageio>=2.36,<3",
+  "imageio-ffmpeg>=0.5,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
