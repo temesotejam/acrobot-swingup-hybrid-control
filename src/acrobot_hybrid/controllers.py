@@ -63,6 +63,25 @@ def upright_lqr_gain(plant: AcrobotPlant) -> np.ndarray:
     return np.linalg.solve(r, b.T @ p)
 
 
+def upright_discrete_lqr_gain(
+    plant: AcrobotPlant,
+    q_diagonal: tuple[float, float, float, float, float] = (80.0, 40.0, 5.0, 5.0, 0.25),
+    r_weight: float = 6.0,
+) -> np.ndarray:
+    """Discrete 50 Hz upright LQR tuned to avoid amplifying measurement noise.
+
+    It uses the exact simulator step map and a larger input penalty than the
+    historical continuous-time gain. The latter remains the noiseless baseline;
+    this gain is used only by the noisy estimated-state hold controller.
+    """
+    equilibrium = np.array([math.pi, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    a, b = numerical_discrete_linearization(plant, equilibrium, 0.0)
+    q = np.diag(np.asarray(q_diagonal, dtype=np.float64))
+    r = np.array([[float(r_weight)]], dtype=np.float64)
+    p = solve_discrete_are(a, b, q, r)
+    return np.linalg.solve(r + b.T @ p @ b, b.T @ p @ a)
+
+
 def tvlqr_gains(
     plant: AcrobotPlant,
     nominal_states: np.ndarray,
@@ -70,11 +89,7 @@ def tvlqr_gains(
     q_diagonal: tuple[float, float, float, float, float] = (2.0, 1.0, 0.5, 0.2, 0.05),
     r_weight: float = 5.0,
 ) -> np.ndarray:
-    """Finite-horizon discrete TVLQR around the optimized swing-up trajectory.
-
-    The trajectory uses a slightly smaller torque bound than the physical plant,
-    leaving actuator headroom for this feedback correction.
-    """
+    """Finite-horizon discrete TVLQR around the optimized swing-up trajectory."""
     states = np.asarray(nominal_states, dtype=np.float64)
     commands = np.asarray(nominal_commands_nm, dtype=np.float64).reshape(-1)
     if states.shape != (5, commands.size + 1):
