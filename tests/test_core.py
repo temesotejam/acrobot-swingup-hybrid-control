@@ -11,9 +11,11 @@ from acrobot_hybrid.controllers import (
     trajectory_feedback_command,
     upright_lqr_gain,
 )
+from acrobot_hybrid.holdout import holdout_physics_models
 from acrobot_hybrid.optimization import generate_energy_seed
 from acrobot_hybrid.plant import AcrobotPlant, PhysicsConfig
 from acrobot_hybrid.robustness import default_robustness_scenarios
+from acrobot_hybrid.sensing import NoisyStateSensor, SensorNoiseConfig
 
 
 def test_geometry_and_energy_gap_match_benchmark() -> None:
@@ -100,3 +102,23 @@ def test_model_bank_estimator_selects_exact_transition_model() -> None:
             estimator.update(current, command, next_state)
             current = next_state
         assert estimator.selected_model() == expected_name
+
+
+def test_holdout_models_are_not_stored_bank_entries() -> None:
+    nominal = PhysicsConfig()
+    bank = list(candidate_physics_models(nominal).values())
+    holdouts = holdout_physics_models(nominal)
+    assert len(holdouts) == 8
+    assert all(item.physics not in bank for item in holdouts)
+
+
+def test_noisy_sensor_is_reproducible_and_episode_biased() -> None:
+    config = SensorNoiseConfig()
+    sensor_a = NoisyStateSensor(config, seed=123)
+    sensor_b = NoisyStateSensor(config, seed=123)
+    state = np.zeros(5, dtype=np.float64)
+    observations_a = [sensor_a.observe(state) for _ in range(3)]
+    observations_b = [sensor_b.observe(state) for _ in range(3)]
+    for left, right in zip(observations_a, observations_b, strict=True):
+        assert np.allclose(left, right)
+    assert np.linalg.norm(sensor_a.bias[:2]) > 0.0
