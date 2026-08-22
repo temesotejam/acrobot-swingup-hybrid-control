@@ -11,10 +11,12 @@ import numpy as np
 from .adaptive import build_adaptive_library
 from .controllers import tvlqr_gains, upright_lqr_gain
 from .evaluation import evaluate_history
+from .holdout import evaluate_holdout_robustness
 from .optimization import optimize_nominal_trajectory
 from .plant import AcrobotPlant, PhysicsConfig, wrap_angle
 from .rendering import write_plots, write_video
 from .robustness import evaluate_robustness
+from .sensing import SensorNoiseConfig
 from .simulation import simulate_optimized_hybrid, simulate_tvlqr_hybrid
 
 
@@ -30,6 +32,17 @@ def _write_robustness_csv(path: Path, rows: list[dict]) -> None:
     fields = [
         "scenario", "group", "controller", "selected_model", "capture", "capture_time_s", "final_stable",
         "stable_ratio", "final_2s_stable_ratio", "final_tip_height_m", "rms_torque_nm",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_holdout_csv(path: Path, rows: list[dict]) -> None:
+    fields = [
+        "scenario", "condition", "sensor_seed", "selected_model", "capture", "capture_time_s",
+        "final_stable", "stable_ratio", "final_2s_stable_ratio",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -107,6 +120,15 @@ def main() -> None:
         adaptive_library=adaptive_library,
     )
 
+    sensor_noise = SensorNoiseConfig()
+    holdout_rows, holdout_summary = evaluate_holdout_robustness(
+        physics,
+        adaptive_library,
+        identification_s=0.5,
+        noisy_seeds=(11, 22, 33),
+        sensor_noise=sensor_noise,
+    )
+
     terminal = optimization.states[:, -1]
     target = optimization.target_state
     optimizer_terminal = {
@@ -135,6 +157,15 @@ def main() -> None:
         and int(model_adaptive["final_stable_count"]) >= int(model_tvlqr["final_stable_count"]) + 2
         and int(model_adaptive["capture_count"]) >= 7
         and identification_correct >= 7
+    )
+
+    clean_holdout = holdout_summary["clean-holdout"]
+    noisy_holdout = holdout_summary["noisy-holdout"]
+    holdout_gate = (
+        int(clean_holdout["final_stable_count"]) >= 6
+        and int(clean_holdout["capture_count"]) >= 7
+        and int(noisy_holdout["final_stable_count"]) >= 18
+        and int(noisy_holdout["capture_count"]) >= 20
     )
 
     library_summary: dict[str, dict] = {}
@@ -171,13 +202,17 @@ def main() -> None:
         "adaptive_library": library_summary,
         "adaptive_identification_correct": int(identification_correct),
         "adaptive_identification_total": int(len(model_rows)),
+        "sensor_noise": sensor_noise.__dict__,
+        "holdout_summary": holdout_summary,
+        "holdout_rows": _json_safe(holdout_rows),
         "metrics": metrics.to_dict(),
         "open_loop_nominal_metrics": open_loop_metrics.to_dict(),
         "robustness_summary": robustness_summary,
         "robustness_rows": _json_safe(robustness_rows),
         "robustness_gate": bool(robustness_gate),
         "adaptive_model_mismatch_gate": bool(adaptive_gate),
-        "success": bool(metrics.capture and metrics.final_stable and robustness_gate and adaptive_gate),
+        "holdout_noise_gate": bool(holdout_gate),
+        "success": bool(metrics.capture and metrics.final_stable and robustness_gate and adaptive_gate and holdout_gate),
     }
 
     np.savez_compressed(
@@ -194,8 +229,13 @@ def main() -> None:
     np.save(output / "tvlqr_gains.npy", gains)
     _write_csv(output / "trajectory.csv", history.times_s, history.states, history.commands_nm, history.modes, plant)
     _write_robustness_csv(output / "robustness.csv", robustness_rows)
+    _write_holdout_csv(output / "holdout.csv", holdout_rows)
     (output / "robustness.json").write_text(
         json.dumps(_json_safe({"summary": robustness_summary, "rows": robustness_rows}), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (output / "holdout.json").write_text(
+        json.dumps(_json_safe({"summary": holdout_summary, "rows": holdout_rows, "sensor_noise": sensor_noise.__dict__}), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     (output / "adaptive-library.json").write_text(
@@ -242,21 +282,21 @@ def main() -> None:
 | model mismatch | {_count_text(model_ol)} | {_count_text(model_tv)} | **{_count_text(model_ad)}** | {_capture_text(model_ad)} |
 | +/-5 deg stress | {_count_text(stress_ol)} | {_count_text(stress_tv)} | **{_count_text(stress_ad)}** | {_capture_text(stress_ad)} |
 
-The initial-state TVLQR 8/8 gate remains.  The new adaptive gate additionally requires at least **6/8 Final stable** and **7/8 Capture** on model mismatch, an improvement of at least two Final-stable cases over fixed-model TVLQR.  Model selection is based only on the first 0.5 s of observed state transitions; exact model-identification score: **{identification_correct}/{len(model_rows)}**.
+## Hold-out generalization
 
-## Optimizer terminal before local LQR
+| Condition | Final stable | Capture |
+|---|---:|---:|
+| bank-interior parameters, clean | **{_count_text(clean_holdout)}** | {_capture_text(clean_holdout)} |
+| same parameters + sensor noise/bias, 3 seeds each | **{_count_text(noisy_holdout)}** | {_capture_text(noisy_holdout)} |
 
-- theta1 error: `{optimizer_terminal['theta1_error_deg']:.4f} deg`
-- theta2 error: `{optimizer_terminal['theta2_error_deg']:.4f} deg`
-- dtheta1: `{optimizer_terminal['dtheta1_rad_s']:.5f} rad/s`
-- dtheta2: `{optimizer_terminal['dtheta2_rad_s']:.5f} rad/s`
+The hold-out values are not entries in the controller bank. Noisy tests use 0.25 deg angle white noise, 1.0 deg episode angle bias, 0.10 deg/s gyro white noise and 0.30 deg/s gyro bias throughout identification and feedback control.
 
-`success=true` now requires nominal Capture + Final stable, the original initial-state robustness gate, and the adaptive model-mismatch improvement gate.
+`success=true` requires nominal performance, the original initial-state and endpoint-model gates, plus at least 6/8 clean hold-out Final stable and 18/24 noisy hold-out Final stable.
 """
     (output / "summary.md").write_text(markdown, encoding="utf-8")
     print(markdown)
     if not summary["success"]:
-        raise SystemExit("Adaptive hybrid controller did not meet nominal + robustness improvement criteria")
+        raise SystemExit("Adaptive hybrid controller did not meet hold-out + noisy generalization criteria")
 
 
 if __name__ == "__main__":

@@ -93,10 +93,7 @@ def optimize_nominal_trajectory(
 
     theta1_turn = round((seed_states[-1, 0] - math.pi) / (2.0 * math.pi))
     theta2_turn = round(seed_states[-1, 1] / (2.0 * math.pi))
-    target = np.array(
-        [math.pi + 2.0 * math.pi * theta1_turn, 2.0 * math.pi * theta2_turn, 0.0, 0.0, 0.0],
-        dtype=np.float64,
-    )
+    target = np.array([math.pi + 2.0 * math.pi * theta1_turn, 2.0 * math.pi * theta2_turn, 0.0, 0.0, 0.0], dtype=np.float64)
 
     opti = ca.Opti()
     x = opti.variable(5, steps + 1)
@@ -107,26 +104,14 @@ def optimize_nominal_trajectory(
     opti.subject_to(opti.bounded(-torque_limit, u, torque_limit))
 
     error = x[:, -1] - ca.DM(target)
-    objective = (
-        10000.0 * error[0] ** 2
-        + 5000.0 * error[1] ** 2
-        + 1500.0 * error[2] ** 2
-        + 800.0 * error[3] ** 2
-        + 100.0 * error[4] ** 2
-    )
+    objective = 10000.0 * error[0] ** 2 + 5000.0 * error[1] ** 2 + 1500.0 * error[2] ** 2 + 800.0 * error[3] ** 2 + 100.0 * error[4] ** 2
     settle_start = int(0.85 * steps)
     for index in range(steps):
         objective += 0.001 * u[0, index] ** 2
         if index >= settle_start:
             settle_error = x[:, index] - ca.DM(target)
-            objective += (
-                0.20 * settle_error[0] ** 2
-                + 0.10 * settle_error[1] ** 2
-                + 0.05 * settle_error[2] ** 2
-                + 0.03 * settle_error[3] ** 2
-            )
+            objective += 0.20 * settle_error[0] ** 2 + 0.10 * settle_error[1] ** 2 + 0.05 * settle_error[2] ** 2 + 0.03 * settle_error[3] ** 2
     opti.minimize(objective)
-
     opti.set_initial(x, seed_states.T)
     opti.set_initial(u, np.clip(seed_commands, -torque_limit, torque_limit).reshape(1, -1))
     _configure_solver(opti)
@@ -149,20 +134,12 @@ def refine_trajectory_for_model(
     terminal_velocity_tolerance_rad_s: float = 0.05,
     terminal_torque_tolerance_nm: float = 0.10,
 ) -> OptimizationResult:
-    """Re-optimize a known-good swing-up for a nearby model.
-
-    The nominal optimized trajectory is used as the warm start and regularizing
-    reference.  Hard terminal constraints force every library trajectory into
-    the local upright-controller basin instead of accepting a merely high tip.
-    """
+    """Re-optimize a known-good swing-up for a nearby model."""
     p = plant.config
     steps = reference.commands_nm.size
     if reference.states.shape != (5, steps + 1):
         raise ValueError("reference trajectory shape is inconsistent")
     torque_limit = float(nominal_torque_limit_nm)
-    if not 0.0 < torque_limit <= p.max_torque_nm:
-        raise ValueError("nominal_torque_limit_nm must be within the physical torque bound")
-
     target = np.asarray(reference.target_state, dtype=np.float64).copy()
     opti = ca.Opti()
     x = opti.variable(5, steps + 1)
@@ -182,13 +159,7 @@ def refine_trajectory_for_model(
     opti.subject_to(opti.bounded(-velocity_tol, terminal[3], velocity_tol))
     opti.subject_to(opti.bounded(-torque_tol, terminal[4], torque_tol))
 
-    objective = (
-        1500.0 * terminal[0] ** 2
-        + 800.0 * terminal[1] ** 2
-        + 300.0 * terminal[2] ** 2
-        + 180.0 * terminal[3] ** 2
-        + 20.0 * terminal[4] ** 2
-    )
+    objective = 1500.0 * terminal[0] ** 2 + 800.0 * terminal[1] ** 2 + 300.0 * terminal[2] ** 2 + 180.0 * terminal[3] ** 2 + 20.0 * terminal[4] ** 2
     state_weights = np.array([0.05, 0.03, 0.01, 0.006, 0.001], dtype=np.float64)
     for index in range(steps):
         state_error = x[:, index] - ca.DM(reference.states[:, index])
@@ -197,10 +168,86 @@ def refine_trajectory_for_model(
         for state_index, weight in enumerate(state_weights):
             objective += float(weight) * state_error[state_index] ** 2
     opti.minimize(objective)
-
     opti.set_initial(x, reference.states)
     opti.set_initial(u, np.clip(reference.commands_nm, -torque_limit, torque_limit).reshape(1, -1))
     _configure_solver(opti, max_iter=1200)
+    solution = opti.solve()
+    return OptimizationResult(
+        states=np.asarray(solution.value(x), dtype=np.float64),
+        commands_nm=np.asarray(solution.value(u), dtype=np.float64).reshape(-1),
+        target_state=target,
+        objective=float(solution.value(objective)),
+        solver_status=str(opti.stats().get("return_status", "unknown")),
+        nominal_torque_limit_nm=torque_limit,
+    )
+
+
+def replan_terminal_from_state(
+    plant: AcrobotPlant,
+    start_state: np.ndarray,
+    reference: OptimizationResult,
+    start_index: int,
+    torque_limit_nm: float = 1.0,
+    terminal_angle_tolerance_deg: float = 0.35,
+    terminal_velocity_tolerance_rad_s: float = 0.035,
+    terminal_torque_tolerance_nm: float = 0.08,
+) -> OptimizationResult:
+    """Short nonlinear MPC-style replan from the current estimate to upright.
+
+    This is intended for the final few seconds of swing-up. The remaining
+    selected trajectory is a warm start, but the first state is replaced by the
+    latest filtered estimate and IPOPT is required to return to the local LQR
+    basin under the selected/interpolated dynamics.
+    """
+    p = plant.config
+    start_index = int(start_index)
+    if not 0 <= start_index < reference.commands_nm.size:
+        raise ValueError("start_index must lie inside the reference trajectory")
+    ref_states = np.asarray(reference.states[:, start_index:], dtype=np.float64)
+    ref_commands = np.asarray(reference.commands_nm[start_index:], dtype=np.float64)
+    steps = ref_commands.size
+    if steps < 10:
+        raise ValueError("terminal replan needs at least 10 control steps")
+    start = np.asarray(start_state, dtype=np.float64).copy()
+    target = np.asarray(reference.target_state, dtype=np.float64).copy()
+    torque_limit = min(float(torque_limit_nm), float(p.max_torque_nm))
+
+    opti = ca.Opti()
+    x = opti.variable(5, steps + 1)
+    u = opti.variable(1, steps)
+    opti.subject_to(x[:, 0] == ca.DM(start))
+    for index in range(steps):
+        opti.subject_to(x[:, index + 1] == _rk4(x[:, index], u[:, index], p))
+    opti.subject_to(opti.bounded(-torque_limit, u, torque_limit))
+
+    terminal = x[:, -1] - ca.DM(target)
+    angle_tol = math.radians(float(terminal_angle_tolerance_deg))
+    velocity_tol = float(terminal_velocity_tolerance_rad_s)
+    torque_tol = float(terminal_torque_tolerance_nm)
+    opti.subject_to(opti.bounded(-angle_tol, terminal[0], angle_tol))
+    opti.subject_to(opti.bounded(-angle_tol, terminal[1], angle_tol))
+    opti.subject_to(opti.bounded(-velocity_tol, terminal[2], velocity_tol))
+    opti.subject_to(opti.bounded(-velocity_tol, terminal[3], velocity_tol))
+    opti.subject_to(opti.bounded(-torque_tol, terminal[4], torque_tol))
+
+    objective = 3000.0 * terminal[0] ** 2 + 1800.0 * terminal[1] ** 2 + 500.0 * terminal[2] ** 2 + 300.0 * terminal[3] ** 2 + 30.0 * terminal[4] ** 2
+    for index in range(steps):
+        state_error = x[:, index] - ca.DM(ref_states[:, index])
+        command_error = u[0, index] - float(ref_commands[index])
+        objective += 0.004 * command_error**2
+        objective += 0.005 * state_error[0] ** 2 + 0.003 * state_error[1] ** 2 + 0.001 * state_error[2] ** 2 + 0.001 * state_error[3] ** 2
+    opti.minimize(objective)
+
+    # Warm-start with the remaining reference plus a linearly decaying state
+    # offset so the initial guess satisfies the new current-state boundary.
+    offset = start - ref_states[:, 0]
+    guess_states = ref_states.copy()
+    for index in range(steps + 1):
+        fraction = 1.0 - index / steps
+        guess_states[:, index] += fraction * offset
+    opti.set_initial(x, guess_states)
+    opti.set_initial(u, np.clip(ref_commands, -torque_limit, torque_limit).reshape(1, -1))
+    _configure_solver(opti, max_iter=700)
     solution = opti.solve()
     return OptimizationResult(
         states=np.asarray(solution.value(x), dtype=np.float64),

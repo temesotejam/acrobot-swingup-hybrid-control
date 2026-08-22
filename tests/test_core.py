@@ -9,11 +9,15 @@ from acrobot_hybrid.controllers import (
     lqr_command,
     numerical_discrete_linearization,
     trajectory_feedback_command,
+    upright_discrete_lqr_gain,
     upright_lqr_gain,
 )
+from acrobot_hybrid.holdout import holdout_physics_models
 from acrobot_hybrid.optimization import generate_energy_seed
 from acrobot_hybrid.plant import AcrobotPlant, PhysicsConfig
 from acrobot_hybrid.robustness import default_robustness_scenarios
+from acrobot_hybrid.sensing import ExtendedKalmanObserver, NoisyStateSensor, SensorNoiseConfig
+from acrobot_hybrid.terminal_replan import _upright_lqr_ready
 
 
 def test_geometry_and_energy_gap_match_benchmark() -> None:
@@ -37,16 +41,37 @@ def test_energy_seed_reaches_upright_energy_manifold() -> None:
 
 def test_local_lqr_stabilizes_small_upright_perturbation() -> None:
     plant = AcrobotPlant(PhysicsConfig(), wrap_angles=False)
-    gain = upright_lqr_gain(plant)
     target = np.array([math.pi, 0.0, 0.0, 0.0, 0.0])
-    state = target.copy()
-    state[0] += math.radians(0.1)
-    initial_error = abs(state[0] - target[0])
-    for _ in range(int(round(2.0 / plant.config.dt_s))):
-        command = lqr_command(state, target, gain, plant.config.max_torque_nm)
-        state = plant.step(state, command)
-    assert abs(state[0] - target[0]) < initial_error
-    assert plant.tip_height_m(state) > 1.99
+    for gain in (upright_lqr_gain(plant), upright_discrete_lqr_gain(plant)):
+        state = target.copy()
+        state[0] += math.radians(0.1)
+        for _ in range(int(round(5.0 / plant.config.dt_s))):
+            command = lqr_command(state, target, gain, plant.config.max_torque_nm)
+            state = plant.step(state, command)
+        # Acrobot is underactuated, so theta1 alone need not decrease
+        # monotonically. The actual upright condition is coupled geometry + low
+        # joint speeds, matching the benchmark's stability definition.
+        assert plant.tip_height_m(state) > 1.999
+        assert abs(state[2]) < 0.02
+        assert abs(state[3]) < 0.02
+
+
+def test_verified_lqr_handoff_rejects_states_outside_local_basin() -> None:
+    plant = AcrobotPlant(PhysicsConfig(), wrap_angles=False)
+    target = np.array([math.pi, 0.0, 0.0, 0.0, 0.0])
+    gain = upright_discrete_lqr_gain(plant)
+
+    safe = target.copy()
+    safe[0] += math.radians(0.1)
+    assert _upright_lqr_ready(plant, safe, target, gain)
+
+    angle_outside = target.copy()
+    angle_outside[0] += math.radians(1.0)
+    assert not _upright_lqr_ready(plant, angle_outside, target, gain)
+
+    velocity_outside = target.copy()
+    velocity_outside[2] = 0.03
+    assert not _upright_lqr_ready(plant, velocity_outside, target, gain)
 
 
 def test_discrete_linearization_matches_step_dimensions() -> None:
@@ -80,10 +105,7 @@ def test_model_bank_matches_model_mismatch_uncertainty_set() -> None:
     models = candidate_physics_models(PhysicsConfig())
     assert len(models) == 9
     assert "nominal" in models
-    scenario_names = {
-        item.name for item in default_robustness_scenarios(PhysicsConfig())
-        if item.group == "model-mismatch"
-    }
+    scenario_names = {item.name for item in default_robustness_scenarios(PhysicsConfig()) if item.group == "model-mismatch"}
     assert scenario_names == set(models) - {"nominal"}
 
 
@@ -100,3 +122,40 @@ def test_model_bank_estimator_selects_exact_transition_model() -> None:
             estimator.update(current, command, next_state)
             current = next_state
         assert estimator.selected_model() == expected_name
+
+
+def test_holdout_models_are_not_stored_bank_entries() -> None:
+    nominal = PhysicsConfig()
+    bank = list(candidate_physics_models(nominal).values())
+    holdouts = holdout_physics_models(nominal)
+    assert len(holdouts) == 8
+    assert all(item.physics not in bank for item in holdouts)
+
+
+def test_noisy_sensor_is_reproducible_and_episode_biased() -> None:
+    config = SensorNoiseConfig()
+    sensor_a = NoisyStateSensor(config, seed=123)
+    sensor_b = NoisyStateSensor(config, seed=123)
+    state = np.zeros(5, dtype=np.float64)
+    observations_a = [sensor_a.observe(state) for _ in range(3)]
+    observations_b = [sensor_b.observe(state) for _ in range(3)]
+    for left, right in zip(observations_a, observations_b, strict=True):
+        assert np.allclose(left, right)
+    assert np.linalg.norm(sensor_a.bias[:2]) > 0.0
+
+
+def test_extended_kalman_observer_reduces_white_noise_at_upright() -> None:
+    plant = AcrobotPlant(PhysicsConfig(), wrap_angles=False)
+    config = SensorNoiseConfig(angle_bias_std_deg=0.0, gyro_bias_std_dps=0.0, torque_bias_std_nm=0.0)
+    sensor = NoisyStateSensor(config, seed=7)
+    target = np.array([math.pi, 0.0, 0.0, 0.0, 0.0])
+    first = sensor.observe(target)
+    observer = ExtendedKalmanObserver(plant, first, config)
+    raw_errors = []
+    filtered_errors = []
+    for _ in range(100):
+        measurement = sensor.observe(target)
+        estimate = observer.update(0.0, measurement)
+        raw_errors.append(abs(measurement[0] - target[0]))
+        filtered_errors.append(abs(estimate[0] - target[0]))
+    assert np.mean(filtered_errors[20:]) < np.mean(raw_errors[20:])
