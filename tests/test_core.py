@@ -17,6 +17,7 @@ from acrobot_hybrid.optimization import generate_energy_seed
 from acrobot_hybrid.plant import AcrobotPlant, PhysicsConfig
 from acrobot_hybrid.robustness import default_robustness_scenarios
 from acrobot_hybrid.sensing import ExtendedKalmanObserver, NoisyStateSensor, SensorNoiseConfig
+from acrobot_hybrid.terminal_replan import _upright_lqr_ready
 
 
 def test_geometry_and_energy_gap_match_benchmark() -> None:
@@ -53,6 +54,24 @@ def test_local_lqr_stabilizes_small_upright_perturbation() -> None:
         assert plant.tip_height_m(state) > 1.999
         assert abs(state[2]) < 0.02
         assert abs(state[3]) < 0.02
+
+
+def test_verified_lqr_handoff_rejects_states_outside_local_basin() -> None:
+    plant = AcrobotPlant(PhysicsConfig(), wrap_angles=False)
+    target = np.array([math.pi, 0.0, 0.0, 0.0, 0.0])
+    gain = upright_discrete_lqr_gain(plant)
+
+    safe = target.copy()
+    safe[0] += math.radians(0.1)
+    assert _upright_lqr_ready(plant, safe, target, gain)
+
+    angle_outside = target.copy()
+    angle_outside[0] += math.radians(1.0)
+    assert not _upright_lqr_ready(plant, angle_outside, target, gain)
+
+    velocity_outside = target.copy()
+    velocity_outside[2] = 0.03
+    assert not _upright_lqr_ready(plant, velocity_outside, target, gain)
 
 
 def test_discrete_linearization_matches_step_dimensions() -> None:
