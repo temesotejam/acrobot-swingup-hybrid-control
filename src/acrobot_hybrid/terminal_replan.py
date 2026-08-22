@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import casadi as ca
+import math
 import numpy as np
 
 from .adaptive import (
@@ -87,6 +88,30 @@ def _reference_tail(reference: OptimizationResult, start_index: int) -> Optimiza
     )
 
 
+def _wrapped_error(value: float, target: float) -> float:
+    return math.atan2(math.sin(value - target), math.cos(value - target))
+
+
+def _upright_lqr_ready(plant: AcrobotPlant, state: np.ndarray, target: np.ndarray) -> bool:
+    """Conservative entry set for the noisy upright regulator.
+
+    The benchmark Capture metric is deliberately broad, so it is not a safe
+    switching condition for a local LQR.  This supervisor instead requires
+    direct joint-angle proximity, low joint speed and high tip height for a
+    short dwell before handing control to the upright regulator.
+    """
+    state = np.asarray(state, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    return bool(
+        plant.tip_height_m(state) >= 1.90
+        and abs(_wrapped_error(float(state[0]), float(target[0]))) <= math.radians(12.0)
+        and abs(_wrapped_error(float(state[1]), float(target[1]))) <= math.radians(15.0)
+        and abs(float(state[2])) <= 0.40
+        and abs(float(state[3])) <= 0.60
+        and abs(float(state[4])) <= 0.60
+    )
+
+
 def simulate_terminal_replan_hybrid(
     simulation_plant: AcrobotPlant,
     library: dict[str, AdaptiveLibraryEntry],
@@ -96,10 +121,24 @@ def simulate_terminal_replan_hybrid(
     sensor_noise: SensorNoiseConfig | None = None,
     sensor_seed: int = 0,
     calibration_samples: int = 50,
+    hold_state_source: str = "ekf",
+    capture_supervisor: bool = False,
+    capture_supervisor_start_s: float = 18.0,
+    capture_supervisor_dwell_s: float = 0.20,
 ) -> AdaptiveSimulationResult:
-    """Adaptive TVLQR with late re-identification and one nonlinear MPC replan."""
+    """Adaptive TVLQR with late re-identification and one nonlinear MPC replan.
+
+    ``hold_state_source`` is also used for diagnosis under noisy sensing:
+    ``true`` isolates the regulator from estimation error, ``measurement``
+    uses the bias-corrected raw state measurement, and ``ekf`` uses the
+    nonlinear process-model EKF.  ``capture_supervisor`` replaces the fixed
+    end-of-trajectory handoff with a conservative state-and-dwell gate.
+    """
     if "nominal" not in library:
         raise ValueError("adaptive library must contain nominal")
+    if hold_state_source not in {"true", "measurement", "ekf"}:
+        raise ValueError("hold_state_source must be 'true', 'measurement' or 'ekf'")
+
     nominal = library["nominal"]
     dt = simulation_plant.config.dt_s
     estimator = ModelBankEstimator({name: entry.plant.config for name, entry in library.items()})
@@ -181,6 +220,8 @@ def simulate_terminal_replan_hybrid(
         replan_gains = selected.tvlqr[replan_index:].copy()
         replan_mode = "replan-fallback"
 
+    required_ready_steps = max(1, int(round(capture_supervisor_dwell_s / dt)))
+    ready_streak = 0
     for local_index, nominal_command in enumerate(replan.commands_nm):
         command = trajectory_feedback_command(
             control_state,
@@ -198,25 +239,46 @@ def simulate_terminal_replan_hybrid(
         commands.append(command)
         modes.append(replan_mode)
 
+        if capture_supervisor and (global_index + 1) * dt >= capture_supervisor_start_s:
+            ready_streak = (
+                ready_streak + 1
+                if _upright_lqr_ready(selected.plant, control_state, replan.target_state)
+                else 0
+            )
+            if ready_streak >= required_ready_steps:
+                break
+
     switch_time_s = len(states) * dt
     total_steps = int(round(total_s / dt))
-    if sensor is None:
-        hold_estimator = None
-        hold_gain = selected.upright_lqr
-    else:
+    hold_estimator = None
+    if sensor is not None and hold_state_source == "ekf":
         hold_estimator = ExtendedKalmanObserver(selected.plant, control_state, sensor_noise)
-        hold_gain = upright_discrete_lqr_gain(selected.plant)
+    hold_gain = selected.upright_lqr if sensor is None else upright_discrete_lqr_gain(selected.plant)
 
     while len(states) < total_steps:
-        hold_state = control_state if hold_estimator is None else hold_estimator.estimate
+        if sensor is None or hold_state_source == "true":
+            hold_state = state
+        elif hold_state_source == "measurement":
+            hold_state = measurement
+        else:
+            if hold_estimator is None:
+                raise RuntimeError("EKF hold source requested without an estimator")
+            hold_state = hold_estimator.estimate
+
         command = lqr_command(hold_state, replan.target_state, hold_gain, simulation_plant.config.max_torque_nm)
         state = simulation_plant.step(state, command)
         measurement = observe(state)
-        control_state = measurement.copy() if hold_estimator is None else hold_estimator.update(command, measurement)
+        if hold_estimator is not None:
+            control_state = hold_estimator.update(command, measurement)
+        else:
+            control_state = measurement.copy()
         times.append((len(states) + 1) * dt)
         states.append(state.copy())
         commands.append(command)
-        modes.append("replan-lqr")
+        if sensor is None:
+            modes.append("replan-lqr")
+        else:
+            modes.append(f"hold-{hold_state_source}")
 
     history = SimulationHistory(
         times_s=np.asarray(times, dtype=np.float64),
