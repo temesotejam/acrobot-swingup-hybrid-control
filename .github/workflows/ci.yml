@@ -27,7 +27,7 @@ jobs:
   hybrid-benchmark:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -36,14 +36,17 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e ".[dev]"
-      - name: Optimize and simulate
+      - name: Optimize, design TVLQR and run robustness sweep
         run: python -m acrobot_hybrid.run --output-dir results
-      - name: Verify control result
+      - name: Verify closed-loop control result
         run: |
           test -f results/summary.json
           test -f results/summary.md
           test -f results/nominal_trajectory.npz
+          test -f results/tvlqr_gains.npy
           test -f results/trajectory.csv
+          test -f results/robustness.csv
+          test -f results/robustness.json
           test -f results/videos/hybrid.mp4
           test -f results/plots/states.png
           test -f results/plots/height.png
@@ -54,12 +57,26 @@ jobs:
           s = json.loads(Path('results/summary.json').read_text())
           m = s['metrics']
           assert s['success'] is True
+          assert s['robustness_gate'] is True
           assert m['capture'] is True
           assert m['final_stable'] is True
           assert m['final_2s_stable_ratio'] >= 0.80
           assert m['final_tip_height_m'] > 1.99
           assert abs(m['final_theta1_error_deg']) < 0.5
           assert abs(m['final_theta2_error_deg']) < 0.5
+          assert abs(float(s['physical_torque_limit_nm']) - 1.0) < 1e-12
+          assert abs(float(s['nominal_trajectory_torque_limit_nm']) - 0.98) < 1e-12
+          assert s['tvlqr_shape'][0] == 1050
+          assert s['tvlqr_shape'][1:] == [1, 5]
+          initial = s['robustness_summary']['initial-state']
+          assert initial['tvlqr']['count'] == 8
+          assert initial['tvlqr']['final_stable_count'] == 8
+          assert initial['tvlqr']['capture_count'] == 8
+          assert initial['tvlqr']['final_stable_count'] > initial['open-loop']['final_stable_count']
+          model = s['robustness_summary']['model-mismatch']
+          assert model['tvlqr']['count'] == 8
+          stress = s['robustness_summary']['stress']
+          assert stress['tvlqr']['count'] == 4
           terminal = s['optimizer_terminal']
           assert abs(terminal['theta1_error_deg']) < 1.0
           assert abs(terminal['theta2_error_deg']) < 1.0
@@ -71,6 +88,8 @@ jobs:
           python web/build_pages.py --results results --output site --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           test -f site/index.html
           test -f site/videos/hybrid.mp4
+          grep -q 'Robustness: open-loop vs TVLQR' site/index.html
+          grep -q 'Initial-state robustness gate: True' site/index.html
       - uses: actions/upload-artifact@v7
         with:
           name: hybrid-control-${{ github.run_number }}
