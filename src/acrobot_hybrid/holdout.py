@@ -43,6 +43,27 @@ def _summarize(rows: list[dict]) -> dict[str, float | int]:
     }
 
 
+def _result_row(
+    scenario: HoldoutScenario,
+    condition: str,
+    sensor_seed: int,
+    plant: AcrobotPlant,
+    result,
+) -> dict:
+    metrics = evaluate_history(plant, result.history.times_s, result.history.states, result.history.commands_nm)
+    return {
+        "scenario": scenario.name,
+        "condition": condition,
+        "sensor_seed": int(sensor_seed),
+        "selected_model": result.selected_model,
+        "capture": bool(metrics.capture),
+        "capture_time_s": float(metrics.capture_time_s),
+        "final_stable": bool(metrics.final_stable),
+        "stable_ratio": float(metrics.stable_ratio),
+        "final_2s_stable_ratio": float(metrics.final_2s_stable_ratio),
+    }
+
+
 def evaluate_holdout_robustness(
     nominal: PhysicsConfig,
     library: dict[str, AdaptiveLibraryEntry],
@@ -50,9 +71,17 @@ def evaluate_holdout_robustness(
     noisy_seeds: tuple[int, ...] = (11, 22, 33),
     sensor_noise: SensorNoiseConfig | None = None,
 ) -> tuple[list[dict], dict[str, dict[str, float | int]]]:
-    """Evaluate bank-interior parameters with late nonlinear terminal replanning."""
+    """Evaluate bank-interior parameters and diagnose noisy upright hold.
+
+    The primary noisy trials use a conservative state-and-dwell handoff to the
+    EKF-backed upright LQR.  One representative holdout family is additionally
+    replayed with a fixed end-of-trajectory handoff and three hold-state
+    sources.  That separates a bad handoff from estimator error and from a
+    regulator that cannot stabilize the actual plant even with perfect state.
+    """
     sensor_noise = sensor_noise or SensorNoiseConfig()
     rows: list[dict] = []
+    diagnostic_scenario = "motor tau +6% holdout"
 
     for scenario in holdout_physics_models(nominal):
         actual_plant = AcrobotPlant(scenario.physics, wrap_angles=False)
@@ -63,18 +92,7 @@ def evaluate_holdout_robustness(
             replan_start_s=18.0,
             total_s=40.0,
         )
-        clean_metrics = evaluate_history(actual_plant, clean.history.times_s, clean.history.states, clean.history.commands_nm)
-        rows.append({
-            "scenario": scenario.name,
-            "condition": "clean-holdout",
-            "sensor_seed": -1,
-            "selected_model": clean.selected_model,
-            "capture": bool(clean_metrics.capture),
-            "capture_time_s": float(clean_metrics.capture_time_s),
-            "final_stable": bool(clean_metrics.final_stable),
-            "stable_ratio": float(clean_metrics.stable_ratio),
-            "final_2s_stable_ratio": float(clean_metrics.final_2s_stable_ratio),
-        })
+        rows.append(_result_row(scenario, "clean-holdout", -1, actual_plant, clean))
 
         for seed in noisy_seeds:
             noisy = simulate_terminal_replan_hybrid(
@@ -86,20 +104,45 @@ def evaluate_holdout_robustness(
                 sensor_noise=sensor_noise,
                 sensor_seed=seed,
                 calibration_samples=50,
+                hold_state_source="ekf",
+                capture_supervisor=True,
+                capture_supervisor_start_s=18.0,
+                capture_supervisor_dwell_s=0.20,
             )
-            noisy_metrics = evaluate_history(actual_plant, noisy.history.times_s, noisy.history.states, noisy.history.commands_nm)
-            rows.append({
-                "scenario": scenario.name,
-                "condition": "noisy-holdout",
-                "sensor_seed": int(seed),
-                "selected_model": noisy.selected_model,
-                "capture": bool(noisy_metrics.capture),
-                "capture_time_s": float(noisy_metrics.capture_time_s),
-                "final_stable": bool(noisy_metrics.final_stable),
-                "stable_ratio": float(noisy_metrics.stable_ratio),
-                "final_2s_stable_ratio": float(noisy_metrics.final_2s_stable_ratio),
-            })
+            noisy_row = _result_row(scenario, "noisy-holdout", seed, actual_plant, noisy)
+            rows.append(noisy_row)
 
-    clean_rows = [row for row in rows if row["condition"] == "clean-holdout"]
-    noisy_rows = [row for row in rows if row["condition"] == "noisy-holdout"]
-    return rows, {"clean-holdout": _summarize(clean_rows), "noisy-holdout": _summarize(noisy_rows)}
+            if scenario.name == diagnostic_scenario:
+                supervised_row = dict(noisy_row)
+                supervised_row["condition"] = "diagnostic-ekf-supervised"
+                rows.append(supervised_row)
+
+                for hold_source in ("true", "measurement", "ekf"):
+                    diagnostic = simulate_terminal_replan_hybrid(
+                        actual_plant,
+                        library,
+                        identification_s=max(1.0, float(identification_s)),
+                        replan_start_s=18.0,
+                        total_s=40.0,
+                        sensor_noise=sensor_noise,
+                        sensor_seed=seed,
+                        calibration_samples=50,
+                        hold_state_source=hold_source,
+                        capture_supervisor=False,
+                    )
+                    rows.append(
+                        _result_row(
+                            scenario,
+                            f"diagnostic-{hold_source}-fixed-handoff",
+                            seed,
+                            actual_plant,
+                            diagnostic,
+                        )
+                    )
+
+    conditions = sorted({str(row["condition"]) for row in rows})
+    summary = {
+        condition: _summarize([row for row in rows if row["condition"] == condition])
+        for condition in conditions
+    }
+    return rows, summary
