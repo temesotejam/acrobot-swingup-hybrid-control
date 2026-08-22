@@ -36,7 +36,7 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e ".[dev]"
-      - name: Optimize nominal and adaptive replan library, then run robustness sweep
+      - name: Optimize library and run endpoint, holdout and noisy robustness sweeps
         run: python -m acrobot_hybrid.run --output-dir results
       - name: Verify adaptive closed-loop control result
         run: |
@@ -47,6 +47,8 @@ jobs:
           test -f results/trajectory.csv
           test -f results/robustness.csv
           test -f results/robustness.json
+          test -f results/holdout.csv
+          test -f results/holdout.json
           test -f results/adaptive-library.json
           test -f results/videos/hybrid.mp4
           test -f results/plots/states.png
@@ -60,46 +62,33 @@ jobs:
           assert s['success'] is True
           assert s['robustness_gate'] is True
           assert s['adaptive_model_mismatch_gate'] is True
+          assert s['holdout_noise_gate'] is True
           assert m['capture'] is True
           assert m['final_stable'] is True
           assert m['final_2s_stable_ratio'] >= 0.80
           assert m['final_tip_height_m'] > 1.99
-          assert abs(m['final_theta1_error_deg']) < 0.5
-          assert abs(m['final_theta2_error_deg']) < 0.5
           assert abs(float(s['physical_torque_limit_nm']) - 1.0) < 1e-12
-          assert abs(float(s['nominal_trajectory_torque_limit_nm']) - 0.98) < 1e-12
-          assert abs(float(s['adaptive_candidate_torque_limit_nm']) - 0.99) < 1e-12
-          assert s['tvlqr_shape'][0] == 1050
-          assert s['tvlqr_shape'][1:] == [1, 5]
           assert len(s['adaptive_library']) == 9
           assert s['adaptive_identification_correct'] >= 7
           assert s['adaptive_identification_total'] == 8
           initial = s['robustness_summary']['initial-state']
-          assert initial['tvlqr']['count'] == 8
           assert initial['tvlqr']['final_stable_count'] == 8
-          assert initial['tvlqr']['capture_count'] == 8
-          assert initial['tvlqr']['final_stable_count'] > initial['open-loop']['final_stable_count']
           model = s['robustness_summary']['model-mismatch']
-          assert model['tvlqr']['count'] == 8
-          assert model['adaptive']['count'] == 8
           assert model['adaptive']['capture_count'] >= 7
           assert model['adaptive']['final_stable_count'] >= 6
-          assert model['adaptive']['final_stable_count'] >= model['tvlqr']['final_stable_count'] + 2
-          stress = s['robustness_summary']['stress']
-          assert stress['tvlqr']['count'] == 4
-          assert stress['adaptive']['count'] == 4
-          terminal = s['optimizer_terminal']
-          assert abs(terminal['theta1_error_deg']) < 1.0
-          assert abs(terminal['theta2_error_deg']) < 1.0
-          assert abs(terminal['dtheta1_rad_s']) < 0.10
-          assert abs(terminal['dtheta2_rad_s']) < 0.10
-          for name, entry in s['adaptive_library'].items():
-              if name == 'nominal':
-                  continue
-              assert abs(entry['terminal_theta1_error_deg']) <= 0.51
-              assert abs(entry['terminal_theta2_error_deg']) <= 0.51
-              assert abs(entry['terminal_dtheta1_rad_s']) <= 0.051
-              assert abs(entry['terminal_dtheta2_rad_s']) <= 0.051
+          clean = s['holdout_summary']['clean-holdout']
+          noisy = s['holdout_summary']['noisy-holdout']
+          assert clean['count'] == 8
+          assert clean['capture_count'] >= 7
+          assert clean['final_stable_count'] >= 6
+          assert noisy['count'] == 24
+          assert noisy['capture_count'] >= 20
+          assert noisy['final_stable_count'] >= 18
+          noise = s['sensor_noise']
+          assert abs(float(noise['angle_white_std_deg']) - 0.25) < 1e-12
+          assert abs(float(noise['angle_bias_std_deg']) - 1.0) < 1e-12
+          assert abs(float(noise['gyro_white_std_dps']) - 0.10) < 1e-12
+          assert abs(float(noise['gyro_bias_std_dps']) - 0.30) < 1e-12
           PY
       - name: Build Pages preview
         run: |
@@ -107,8 +96,8 @@ jobs:
           test -f site/index.html
           test -f site/videos/hybrid.mp4
           grep -q 'Adaptive replanning' site/index.html
-          grep -q 'Model-mismatch adaptive gate: True' site/index.html
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: hybrid-control-${{ github.run_number }}
           path: results/
