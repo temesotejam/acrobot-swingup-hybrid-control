@@ -7,6 +7,7 @@ import numpy as np
 from .controllers import lqr_command, trajectory_feedback_command, tvlqr_gains, upright_lqr_gain
 from .optimization import OptimizationResult, refine_trajectory_for_model
 from .plant import AcrobotPlant, PhysicsConfig
+from .sensing import NoisyStateSensor, SensorNoiseConfig
 from .simulation import SimulationHistory
 
 
@@ -31,7 +32,7 @@ def candidate_physics_models(nominal: PhysicsConfig) -> dict[str, PhysicsConfig]
     """Uncertainty bank used by the online multiple-model estimator.
 
     These are controller hypotheses, not privileged access to the simulated
-    plant.  Selection is made only from observed state transitions.
+    plant. Selection is made only from observed state transitions.
     """
     return {
         "nominal": nominal,
@@ -138,13 +139,14 @@ def simulate_adaptive_hybrid(
     initial_state: np.ndarray | None = None,
     identification_s: float = 0.5,
     total_s: float = 40.0,
+    sensor_noise: SensorNoiseConfig | None = None,
+    sensor_seed: int = 0,
 ) -> AdaptiveSimulationResult:
     """Identify the plant online, then switch to its nonlinear replan + TVLQR.
 
-    The first short segment uses the nominal feedback trajectory.  Candidate
-    scores are accumulated only from observed (x, u, x_next) transitions.  At
-    the identification boundary the best model is selected once, then its
-    constrained replanned trajectory is tracked to the upright LQR handoff.
+    When `sensor_noise` is supplied, the model estimator and every feedback
+    controller use the same noisy/bias-contaminated measured state. True state
+    is retained only inside the simulator and for post-run evaluation.
     """
     if "nominal" not in library:
         raise ValueError("adaptive library must contain a nominal entry")
@@ -161,6 +163,12 @@ def simulate_adaptive_hybrid(
         nominal.optimization.commands_nm.size - 1,
     )
     state = np.zeros(5, dtype=np.float64) if initial_state is None else np.asarray(initial_state, dtype=np.float64).copy()
+    sensor = None if sensor_noise is None else NoisyStateSensor(sensor_noise, sensor_seed)
+
+    def observe(value: np.ndarray) -> np.ndarray:
+        return np.asarray(value, dtype=np.float64).copy() if sensor is None else sensor.observe(value)
+
+    measured_state = observe(state)
     times: list[float] = []
     states: list[np.ndarray] = []
     commands: list[float] = []
@@ -168,15 +176,16 @@ def simulate_adaptive_hybrid(
 
     for index in range(identify_steps):
         command = trajectory_feedback_command(
-            state,
+            measured_state,
             nominal.optimization.states[:, index],
             float(nominal.optimization.commands_nm[index]),
             nominal.tvlqr[index],
             simulation_plant.config.max_torque_nm,
         )
-        before = state.copy()
+        measured_before = measured_state.copy()
         state = simulation_plant.step(state, command)
-        estimator.update(before, command, state)
+        measured_state = observe(state)
+        estimator.update(measured_before, command, measured_state)
         times.append((index + 1) * dt)
         states.append(state.copy())
         commands.append(command)
@@ -189,13 +198,14 @@ def simulate_adaptive_hybrid(
 
     for index in range(identify_steps, selected.optimization.commands_nm.size):
         command = trajectory_feedback_command(
-            state,
+            measured_state,
             selected.optimization.states[:, index],
             float(selected.optimization.commands_nm[index]),
             selected.tvlqr[index],
             simulation_plant.config.max_torque_nm,
         )
         state = simulation_plant.step(state, command)
+        measured_state = observe(state)
         times.append((index + 1) * dt)
         states.append(state.copy())
         commands.append(command)
@@ -205,12 +215,13 @@ def simulate_adaptive_hybrid(
     total_steps = int(round(total_s / dt))
     while len(states) < total_steps:
         command = lqr_command(
-            state,
+            measured_state,
             selected.optimization.target_state,
             selected.upright_lqr,
             simulation_plant.config.max_torque_nm,
         )
         state = simulation_plant.step(state, command)
+        measured_state = observe(state)
         times.append((len(states) + 1) * dt)
         states.append(state.copy())
         commands.append(command)
