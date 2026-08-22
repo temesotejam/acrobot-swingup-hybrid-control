@@ -27,7 +27,7 @@ jobs:
   hybrid-benchmark:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -36,9 +36,9 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e ".[dev]"
-      - name: Optimize, design TVLQR and run robustness sweep
+      - name: Optimize nominal and adaptive replan library, then run robustness sweep
         run: python -m acrobot_hybrid.run --output-dir results
-      - name: Verify closed-loop control result
+      - name: Verify adaptive closed-loop control result
         run: |
           test -f results/summary.json
           test -f results/summary.md
@@ -47,6 +47,7 @@ jobs:
           test -f results/trajectory.csv
           test -f results/robustness.csv
           test -f results/robustness.json
+          test -f results/adaptive-library.json
           test -f results/videos/hybrid.mp4
           test -f results/plots/states.png
           test -f results/plots/height.png
@@ -58,6 +59,7 @@ jobs:
           m = s['metrics']
           assert s['success'] is True
           assert s['robustness_gate'] is True
+          assert s['adaptive_model_mismatch_gate'] is True
           assert m['capture'] is True
           assert m['final_stable'] is True
           assert m['final_2s_stable_ratio'] >= 0.80
@@ -66,8 +68,12 @@ jobs:
           assert abs(m['final_theta2_error_deg']) < 0.5
           assert abs(float(s['physical_torque_limit_nm']) - 1.0) < 1e-12
           assert abs(float(s['nominal_trajectory_torque_limit_nm']) - 0.98) < 1e-12
+          assert abs(float(s['adaptive_candidate_torque_limit_nm']) - 0.99) < 1e-12
           assert s['tvlqr_shape'][0] == 1050
           assert s['tvlqr_shape'][1:] == [1, 5]
+          assert len(s['adaptive_library']) == 9
+          assert s['adaptive_identification_correct'] >= 7
+          assert s['adaptive_identification_total'] == 8
           initial = s['robustness_summary']['initial-state']
           assert initial['tvlqr']['count'] == 8
           assert initial['tvlqr']['final_stable_count'] == 8
@@ -75,21 +81,33 @@ jobs:
           assert initial['tvlqr']['final_stable_count'] > initial['open-loop']['final_stable_count']
           model = s['robustness_summary']['model-mismatch']
           assert model['tvlqr']['count'] == 8
+          assert model['adaptive']['count'] == 8
+          assert model['adaptive']['capture_count'] >= 7
+          assert model['adaptive']['final_stable_count'] >= 6
+          assert model['adaptive']['final_stable_count'] >= model['tvlqr']['final_stable_count'] + 2
           stress = s['robustness_summary']['stress']
           assert stress['tvlqr']['count'] == 4
+          assert stress['adaptive']['count'] == 4
           terminal = s['optimizer_terminal']
           assert abs(terminal['theta1_error_deg']) < 1.0
           assert abs(terminal['theta2_error_deg']) < 1.0
           assert abs(terminal['dtheta1_rad_s']) < 0.10
           assert abs(terminal['dtheta2_rad_s']) < 0.10
+          for name, entry in s['adaptive_library'].items():
+              if name == 'nominal':
+                  continue
+              assert abs(entry['terminal_theta1_error_deg']) <= 0.51
+              assert abs(entry['terminal_theta2_error_deg']) <= 0.51
+              assert abs(entry['terminal_dtheta1_rad_s']) <= 0.051
+              assert abs(entry['terminal_dtheta2_rad_s']) <= 0.051
           PY
       - name: Build Pages preview
         run: |
           python web/build_pages.py --results results --output site --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           test -f site/index.html
           test -f site/videos/hybrid.mp4
-          grep -q 'Robustness: open-loop vs TVLQR' site/index.html
-          grep -q 'Initial-state robustness gate: True' site/index.html
+          grep -q 'Adaptive replanning' site/index.html
+          grep -q 'Model-mismatch adaptive gate: True' site/index.html
       - uses: actions/upload-artifact@v7
         with:
           name: hybrid-control-${{ github.run_number }}
